@@ -1,0 +1,22 @@
+# EdgeKit 依赖版本契约
+#
+# 记录经过全量测试验证的公开 SPM 依赖版本。
+# 任何版本变更必须通过完整测试套件后才能更新此文件。
+#
+# 格式: key=version
+# 测试守卫: tests/test_scaffold_export.py::TestVersionContract
+#
+# 依赖链 (layout v4, 2026-05-14):
+#   EdgeScaffolding → EdgeKit → edge-engine (vendor MLX C++)
+#                              → swift-transformers
+#                              → GRDB
+
+edge_kit=1.0.0-rc98
+edge_engine=1.0.0-rc138
+swift_transformers=1.3.2
+swift_huggingface=0.9.0
+grdb=7.10.0
+
+# 已移除依赖 (layout v4 重构后不再在解析图中)
+mlx_swift=not-resolved
+mlx_swift_lm=not-resolved

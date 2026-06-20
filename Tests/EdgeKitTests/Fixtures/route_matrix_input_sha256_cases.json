@@ -1,0 +1,36 @@
+{
+  "schema_version": "edgestudio.route_matrix_input_sha256_cases.v0",
+  "contract": "sha256(raw_utf8(input_text)); no unicode normalization",
+  "cases": [
+    {
+      "id": "ascii",
+      "input_text": "list my open tasks",
+      "sha256": "ce69cd9d68094d0b04fbdfeb01bbfd880c242cb4626e73c363cb91dfacdfe6dc"
+    },
+    {
+      "id": "mixed_zh_en",
+      "input_text": "\u5b8c\u6210\u90a3\u4e2a task",
+      "sha256": "4ce0525ba58ad74b80fefd4ed6964730126656f5e6a07db2f03dfb84d4a131db"
+    },
+    {
+      "id": "emoji",
+      "input_text": "\u63d0\u9192\u6211 \u23f0 \u5199\u5468\u62a5",
+      "sha256": "5dd13ee13c1b785e6583b40dd1a65a55b65cdf79ebe3d88e5a02b58ff7c97413"
+    },
+    {
+      "id": "fullwidth_space",
+      "input_text": "\u5b8c\u6210\u3000task",
+      "sha256": "1e8190bbaa26091d6d1ae25343fa053300188fa5327839abd645585486afc103"
+    },
+    {
+      "id": "nfc_cafe",
+      "input_text": "caf\u00e9",
+      "sha256": "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e"
+    },
+    {
+      "id": "nfd_cafe",
+      "input_text": "cafe\u0301",
+      "sha256": "81ef060bcd98adc7824eb5c1ada83c32491b16018e11e79f00ab9d09e04b015a"
+    }
+  ]
+}
