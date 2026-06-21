@@ -5,8 +5,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/AtomGradient/edge-engine.git",
       "state" : {
-        "revision" : "c6538d3c175fd46577ffd9297eebbfdbfe14e9f0",
-        "version" : "1.0.0-rc138"
+        "revision" : "e0fb208f7ee41ef402bc4b5d872bddafb0f148d1",
+        "version" : "1.0.0-rc140"
       }
     },
     {

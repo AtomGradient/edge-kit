@@ -4,7 +4,7 @@
 import Foundation
 
 public enum EdgeKitRuntime {
-    public static let version = "1.0.0-rc98"
+    public static let version = "1.0.0-rc99"
 
     public static var nativeRuntimeVersion: String {
         NativeRuntimeBridge.runtimeVersion

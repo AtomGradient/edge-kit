@@ -8,6 +8,8 @@ import Foundation
 import Tokenizers
 
 public final class VLMEngine: ObservableObject {
+    private static let eosSamplingLogitPenalty: Float = 20
+
     @Published public private(set) var state: EngineState = .idle
     @Published public private(set) var downloadProgress: Double = 0
     @Published public private(set) var lastPolicy: InferencePolicy.Resolved?
@@ -634,6 +636,32 @@ public final class VLMEngine: ObservableObject {
         )
     }
 
+    enum NativeVLMCmlxTextEligibility: Equatable {
+        case eligible
+        case ineligible(reason: String)
+    }
+
+    /// Pure eligibility check for the fast Metal CMLX text path. Temperature > 0
+    /// (the default 0.7) is eligible — sampling runs on CMLX. This is the
+    /// regression guard against re-introducing the old `temperature == 0` reject
+    /// that forced VLM text-only turns onto the slow Swift decoder (~0.5 tok/s).
+    static func nativeVLMCmlxTextEligibility(
+        parameters: EdgeGenerateParameters,
+        hasTools: Bool
+    ) -> NativeVLMCmlxTextEligibility {
+        if hasTools { return .ineligible(reason: "tools_present") }
+        guard parameters.temperature >= 0, parameters.temperature.isFinite else {
+            return .ineligible(reason: "invalid_temperature")
+        }
+        guard parameters.topP.isFinite else {
+            return .ineligible(reason: "invalid_top_p")
+        }
+        if let topK = parameters.topK, topK <= 0 {
+            return .ineligible(reason: "invalid_top_k")
+        }
+        return .eligible
+    }
+
     private func runNativeVLMCmlxTextGenerateIfPossible(
         messages: [ChatMessage],
         promptTokens: [Int],
@@ -651,29 +679,15 @@ public final class VLMEngine: ObservableObject {
         memoryBefore: Int,
         continuation: AsyncThrowingStream<GenerateChunk, Error>.Continuation
     ) async throws -> Bool {
-        guard tools?.isEmpty ?? true else {
-            emitVLMDiagnostic("vlm_cmlx_prompt_cache_incremental_reject reason=tools_present")
-            releaseNativeVLMCmlxSession(container: container, reason: "tools_present")
-            return false
-        }
-        guard parameters.temperature >= 0, parameters.temperature.isFinite else {
-            emitVLMDiagnostic("vlm_cmlx_text_reject reason=invalid_temperature")
-            releaseNativeVLMCmlxSession(container: container, reason: "sampling_requested")
-            return false
-        }
-        guard parameters.temperature == 0 else {
-            emitVLMDiagnostic("vlm_cmlx_text_reject reason=sampling_requested")
-            releaseNativeVLMCmlxSession(container: container, reason: "sampling_requested")
-            return false
-        }
-        guard parameters.topP.isFinite else {
-            emitVLMDiagnostic("vlm_cmlx_text_reject reason=invalid_top_p")
-            releaseNativeVLMCmlxSession(container: container, reason: "invalid_top_p")
-            return false
-        }
-        if let topK = parameters.topK, topK <= 0 {
-            emitVLMDiagnostic("vlm_cmlx_text_reject reason=invalid_top_k")
-            releaseNativeVLMCmlxSession(container: container, reason: "invalid_top_k")
+        switch Self.nativeVLMCmlxTextEligibility(
+            parameters: parameters,
+            hasTools: !(tools?.isEmpty ?? true)
+        ) {
+        case .eligible:
+            break
+        case .ineligible(let reason):
+            emitVLMDiagnostic("vlm_cmlx_text_reject reason=\(reason)")
+            releaseNativeVLMCmlxSession(container: container, reason: reason)
             return false
         }
         let hadMatchingSession = container.isCmlxDecoderLoaded && nativeVLMCmlxSessionMatches(
@@ -758,19 +772,102 @@ public final class VLMEngine: ObservableObject {
             emitVLMDiagnostic("vlm_cmlx_prompt_cache_incremental_reject reason=no_session")
         }
 
+        // Sampling setup. VLM text turns now use the same fast Metal cmlx
+        // decode path as LLM for temperature > 0 (the default is 0.7) instead
+        // of falling back to the slow Swift greedy decoder. The vision tower is
+        // never loaded on this path, so text-only memory stays at the LLM
+        // profile.
+        let useSampledPath = parameters.temperature > 0
+        let cmlxTopK = parameters.topK
+        let cmlxTopP = (parameters.topP > 0 && parameters.topP <= 1) ? parameters.topP : 1
+        let cmlxMinP = parameters.minP
+        var cmlxSamplingRNG = EdgeSeededRandomNumberGenerator(
+            seed: UInt64.random(in: 1...UInt64.max)
+        )
+        try? container.clearCmlxRepetitionPenalty()
+        try? container.clearCmlxEOSSamplingBias()
+        let samplingPenaltiesAreActive = parameters.repetitionPenalty != 1.0 ||
+            parameters.presencePenalty != 0.0 ||
+            parameters.frequencyPenalty != 0.0
+        let useSamplingPenalties = useSampledPath && samplingPenaltiesAreActive
+        let eosSamplingBiasRequested = parameters.minimumGeneratedTokens > 0 ||
+            parameters.eosPenaltyUntilToken > 0
+        let useEOSSamplingBias = useSampledPath &&
+            eosSamplingBiasRequested &&
+            !nativeEndTokenIds.isEmpty
+        func applyVLMCmlxSamplingPenalties(
+            promptSessionTokenIds: [Int],
+            generatedTokenIds: [Int] = []
+        ) throws {
+            try container.setCmlxSamplingPenalties(
+                repetitionPenalty: parameters.repetitionPenalty,
+                repetitionContextTokenIds: LLMEngine.cmlxRepetitionContextTokenIds(
+                    promptSessionTokenIds: promptSessionTokenIds,
+                    generatedTokenIds: generatedTokenIds,
+                    contextSize: parameters.repetitionContextSize
+                ),
+                presencePenalty: parameters.presencePenalty,
+                presenceContextTokenIds: LLMEngine.cmlxRepetitionContextTokenIds(
+                    promptSessionTokenIds: promptSessionTokenIds,
+                    generatedTokenIds: generatedTokenIds,
+                    contextSize: parameters.presenceContextSize
+                ),
+                frequencyPenalty: parameters.frequencyPenalty,
+                frequencyContextTokenIds: LLMEngine.cmlxRepetitionContextTokenIds(
+                    promptSessionTokenIds: promptSessionTokenIds,
+                    generatedTokenIds: generatedTokenIds,
+                    contextSize: parameters.frequencyContextSize
+                )
+            )
+        }
+        func applyVLMCmlxEOSSamplingBias(generatedTokenCount: Int) throws {
+            guard useEOSSamplingBias else { return }
+            let suppress = generatedTokenCount < parameters.minimumGeneratedTokens
+            let logitPenalty: Float = generatedTokenCount < parameters.eosPenaltyUntilToken
+                ? Self.eosSamplingLogitPenalty
+                : 0
+            if suppress || logitPenalty > 0 {
+                try container.setCmlxEOSSamplingBias(
+                    tokenIds: Array(nativeEndTokenIds),
+                    suppress: suppress,
+                    logitPenalty: logitPenalty
+                )
+            } else {
+                try container.clearCmlxEOSSamplingBias()
+            }
+        }
+        defer {
+            if useSamplingPenalties { try? container.clearCmlxRepetitionPenalty() }
+            if useEOSSamplingBias { try? container.clearCmlxEOSSamplingBias() }
+        }
+
         if !promptCacheHit {
             _ = try container.resetCmlxDecoder()
             nativeVLMCmlxTokenIds = []
             nativeVLMCmlxContainsMediaContext = false
         }
         emitVLMDiagnostic(
-            "vlm_cmlx_text_prefill_begin tokens=\(prefillTokens.count) mode=\(promptCacheHit ? "incremental" : "full") cached=\(cachedTokensReused)"
+            "vlm_cmlx_text_prefill_begin tokens=\(prefillTokens.count) mode=\(promptCacheHit ? "incremental" : "full") cached=\(cachedTokensReused) decode=\(useSampledPath ? "sampled" : "greedy")"
         )
+        let residentPromptTokensAfterPrefill = nativeVLMCmlxTokenIds + prefillTokens
+        if useSamplingPenalties {
+            try applyVLMCmlxSamplingPenalties(
+                promptSessionTokenIds: residentPromptTokensAfterPrefill
+            )
+        }
+        if useEOSSamplingBias {
+            try applyVLMCmlxEOSSamplingBias(generatedTokenCount: 0)
+        }
         try Task.checkCancellation()
         var nextTokenID: Int? = try runNativeVLMCmlxTokenPrefill(
             container: container,
             tokenIDs: prefillTokens,
-            parameters: parameters
+            parameters: parameters,
+            useSampledPath: useSampledPath,
+            topK: cmlxTopK,
+            topP: cmlxTopP,
+            minP: cmlxMinP,
+            rng: &cmlxSamplingRNG
         )
         if promptCacheHit {
             nativeVLMCmlxTokenIds.append(contentsOf: prefillTokens)
@@ -782,10 +879,14 @@ public final class VLMEngine: ObservableObject {
         var generatedTokenIds: [Int] = []
         generatedTokenIds.reserveCapacity(parameters.maxTokens)
         var emittedText = ""
+        var stoppedTokenId: Int?
 
         while generatedTokenIds.count < parameters.maxTokens, let tokenID = nextTokenID {
             try Task.checkCancellation()
-            if parameters.stopOnEndToken, nativeEndTokenIds.contains(tokenID) {
+            if parameters.stopOnEndToken,
+               nativeEndTokenIds.contains(tokenID),
+               (!useEOSSamplingBias || generatedTokenIds.count >= parameters.minimumGeneratedTokens) {
+                stoppedTokenId = tokenID
                 break
             }
             generatedTokenIds.append(tokenID)
@@ -810,7 +911,28 @@ public final class VLMEngine: ObservableObject {
                 )
             }
             if generatedTokenIds.count < parameters.maxTokens {
-                nextTokenID = try container.decodeCmlxStep(tokenID: tokenID)
+                if useSampledPath {
+                    if useSamplingPenalties {
+                        try applyVLMCmlxSamplingPenalties(
+                            promptSessionTokenIds: nativeVLMCmlxTokenIds,
+                            generatedTokenIds: generatedTokenIds
+                        )
+                    }
+                    if useEOSSamplingBias {
+                        try applyVLMCmlxEOSSamplingBias(
+                            generatedTokenCount: generatedTokenIds.count
+                        )
+                    }
+                    nextTokenID = try container.nextSampledCmlxToken(
+                        temperature: parameters.temperature,
+                        topK: cmlxTopK,
+                        topP: cmlxTopP,
+                        minP: cmlxMinP,
+                        seed: cmlxSamplingRNG.next()
+                    )
+                } else {
+                    nextTokenID = try container.decodeCmlxStep(tokenID: tokenID)
+                }
             } else {
                 nextTokenID = nil
             }
@@ -820,6 +942,14 @@ public final class VLMEngine: ObservableObject {
         let decodeSeconds = max(endedAt.timeIntervalSince(firstTokenAt), 0.001)
         let memoryAfter = DeviceProfile.captureMemorySnapshot().footprintMB
         nativeVLMCmlxTokenIds.append(contentsOf: generatedTokenIds)
+        // Mirror LLMEngine: the sampled CMLX path commits the stop token into the
+        // native session, so the Swift-side token ledger must include it to keep
+        // next-turn prompt-cache prefix reuse in sync. The greedy path
+        // (decodeCmlxStep) never feeds the unconsumed stop token, so it is excluded
+        // there.
+        if useSampledPath, let stoppedTokenId {
+            nativeVLMCmlxTokenIds.append(stoppedTokenId)
+        }
         nativeVLMCmlxPromptMessages = messages
         nativeVLMCmlxLastAssistantText = NativePromptSessionReuse.normalizeAssistantText(emittedText)
         turnCounter = turn
@@ -837,7 +967,7 @@ public final class VLMEngine: ObservableObject {
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
             policyReasoning: (resolvedPolicy?.reasoning ?? "policy unavailable")
-                + " | nativeVLMTextCmlx=on",
+                + " | nativeVLMTextCmlx=\(useSampledPath ? "sampled" : "greedy")",
             promptCacheHit: promptCacheHit,
             cachedTokensReused: cachedTokensReused,
             thermalState: ThermalManager().level.rawValue,
@@ -849,16 +979,38 @@ public final class VLMEngine: ObservableObject {
     private func runNativeVLMCmlxTokenPrefill(
         container: QwenVLMNativeContainer,
         tokenIDs: [Int],
-        parameters: EdgeGenerateParameters
+        parameters: EdgeGenerateParameters,
+        useSampledPath: Bool,
+        topK: Int?,
+        topP: Float,
+        minP: Float,
+        rng: inout EdgeSeededRandomNumberGenerator
     ) throws -> Int {
         let chunkSize = max(1, parameters.prefillStepSize)
         guard tokenIDs.count > chunkSize else {
+            if useSampledPath {
+                try container.prefillSampledCmlxTokensAsync(
+                    tokenIDs: tokenIDs,
+                    temperature: parameters.temperature,
+                    topK: topK,
+                    topP: topP,
+                    minP: minP,
+                    seed: rng.next()
+                )
+                return try container.nextSampledCmlxToken(
+                    temperature: parameters.temperature,
+                    topK: topK,
+                    topP: topP,
+                    minP: minP,
+                    seed: rng.next()
+                )
+            }
             return try container.prefillCmlxTokens(tokenIDs: tokenIDs)
         }
 
         let chunkCount = Int(ceil(Double(tokenIDs.count) / Double(chunkSize)))
         emitVLMDiagnostic(
-            "vlm_cmlx_text_prefill_chunked total=\(tokenIDs.count) step=\(chunkSize) chunks=\(chunkCount)"
+            "vlm_cmlx_text_prefill_chunked total=\(tokenIDs.count) step=\(chunkSize) chunks=\(chunkCount) decode=\(useSampledPath ? "sampled" : "greedy")"
         )
         var offset = 0
         var chunkIndex = 0
@@ -868,7 +1020,26 @@ public final class VLMEngine: ObservableObject {
             let isLast = end == tokenIDs.count
             chunkIndex += 1
             if isLast {
-                let nextToken = try container.prefillCmlxTokens(tokenIDs: chunk)
+                let nextToken: Int
+                if useSampledPath {
+                    try container.prefillSampledCmlxTokensAsync(
+                        tokenIDs: chunk,
+                        temperature: parameters.temperature,
+                        topK: topK,
+                        topP: topP,
+                        minP: minP,
+                        seed: rng.next()
+                    )
+                    nextToken = try container.nextSampledCmlxToken(
+                        temperature: parameters.temperature,
+                        topK: topK,
+                        topP: topP,
+                        minP: minP,
+                        seed: rng.next()
+                    )
+                } else {
+                    nextToken = try container.prefillCmlxTokens(tokenIDs: chunk)
+                }
                 emitVLMDiagnostic(
                     "vlm_cmlx_text_prefill_chunk_done index=\(chunkIndex) tokens=\(chunk.count) final=true"
                 )
