@@ -76,6 +76,20 @@ final class VLMEngineNativeTests: XCTestCase {
             ),
             .ineligible(reason: "invalid_top_k")
         )
+        XCTAssertEqual(
+            VLMEngine.nativeVLMCmlxTextEligibility(
+                parameters: EdgeGenerateParameters(temperature: 0.7, minP: -0.1),
+                hasTools: false
+            ),
+            .ineligible(reason: "invalid_min_p")
+        )
+        XCTAssertEqual(
+            VLMEngine.nativeVLMCmlxTextEligibility(
+                parameters: EdgeGenerateParameters(temperature: 0.7, repetitionPenalty: 0),
+                hasTools: false
+            ),
+            .ineligible(reason: "invalid_repetition_penalty")
+        )
     }
 
     @MainActor

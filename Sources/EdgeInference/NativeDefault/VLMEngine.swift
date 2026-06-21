@@ -656,8 +656,35 @@ public final class VLMEngine: ObservableObject {
         guard parameters.topP.isFinite else {
             return .ineligible(reason: "invalid_top_p")
         }
+        guard parameters.minP >= 0, parameters.minP.isFinite else {
+            return .ineligible(reason: "invalid_min_p")
+        }
         if let topK = parameters.topK, topK <= 0 {
             return .ineligible(reason: "invalid_top_k")
+        }
+        guard parameters.repetitionPenalty > 0, parameters.repetitionPenalty.isFinite else {
+            return .ineligible(reason: "invalid_repetition_penalty")
+        }
+        guard parameters.repetitionContextSize >= 0 else {
+            return .ineligible(reason: "invalid_repetition_context_size")
+        }
+        guard parameters.presencePenalty.isFinite else {
+            return .ineligible(reason: "invalid_presence_penalty")
+        }
+        guard parameters.presenceContextSize >= 0 else {
+            return .ineligible(reason: "invalid_presence_context_size")
+        }
+        guard parameters.frequencyPenalty.isFinite else {
+            return .ineligible(reason: "invalid_frequency_penalty")
+        }
+        guard parameters.frequencyContextSize >= 0 else {
+            return .ineligible(reason: "invalid_frequency_context_size")
+        }
+        guard parameters.minimumGeneratedTokens >= 0 else {
+            return .ineligible(reason: "invalid_minimum_generated_tokens")
+        }
+        guard parameters.eosPenaltyUntilToken >= 0 else {
+            return .ineligible(reason: "invalid_eos_penalty_until_token")
         }
         return .eligible
     }

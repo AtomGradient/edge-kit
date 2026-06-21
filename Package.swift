@@ -25,7 +25,7 @@ let package = Package(
         .library(name: "EdgeSession",   targets: ["EdgeSession"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/AtomGradient/edge-engine.git", exact: "1.0.0-rc140"),
+        .package(url: "https://github.com/AtomGradient/edge-engine.git", exact: "1.0.0-rc141"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.2"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.10.0"),
     ],
