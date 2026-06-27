@@ -35,6 +35,7 @@ public final class VLMEngine: ObservableObject {
     private var nativeVLMCmlxAttentionCacheQuantization: NativeCmlxAttentionCacheQuantization?
     private var nativeVLMCmlxFrogJumpLayerMask: UInt64 = 0
     private var nativeVLMCmlxAttentionCacheLimit: Int?
+    private var nativeCmlxLimitState = NativeCmlxCommandBufferLimitState()
     public var diagnosticSink: ((String) -> Void)?
 
     private enum NativeVLMImageInput {
@@ -84,6 +85,14 @@ public final class VLMEngine: ObservableObject {
     public init() {}
 
     public func loadLocal(directory: URL, onProgress: ((Double) -> Void)? = nil) async throws {
+        try await loadLocal(directory: directory, options: nil, onProgress: onProgress)
+    }
+
+    public func loadLocal(
+        directory: URL,
+        options: NativeRuntimeLoadOptions?,
+        onProgress: ((Double) -> Void)? = nil
+    ) async throws {
         guard state != .loading else { return }
         state = .loading
         downloadProgress = 0
@@ -94,16 +103,54 @@ public final class VLMEngine: ObservableObject {
             archInfo = ModelArchInfo.load(from: directory)
             let benchmark = DeviceBenchmark.cachedOrCurrent()
             let profile = benchmark.profile
+            let modelSizeGB = LLMEngine.estimateModelSizeGB(directory: directory)
             let plan = MemoryBudgetPlanner.plan(
                 profile: profile,
-                modelSizeGB: LLMEngine.estimateModelSizeGB(directory: directory),
-                measuredBandwidthGBs: benchmark.measuredBandwidthGBs
-            )
+                modelSizeGB: modelSizeGB,
+                measuredBandwidthGBs: benchmark.measuredBandwidthGBs,
+                intent: options?.memoryIntent ?? .balanced
+            ).applying(options)
             currentPlan = plan
             memoryPolicy = MemoryBudgetPlanner.toKVPolicy(plan)
-            _ = NativeRuntimeBridge.applyMetalConfiguration(
-                NativeRuntimeBridge.metalConfiguration(for: plan)
-            )
+            var metalConfiguration = NativeRuntimeBridge.metalConfiguration(for: plan)
+            if let noCopy = options?.quantizedNoCopyBuffersEnabled {
+                metalConfiguration.quantizedNoCopyBuffersEnabled = noCopy
+            }
+            if let qmm = options?.vendoredQuantizedMatmulEnabled {
+                metalConfiguration.useMLXQuantizedMatmul = qmm
+            }
+            if let prefillQMM = options?.vendoredQuantizedPrefillMatmulEnabled {
+                metalConfiguration.useMLXQuantizedPrefillMatmul = prefillQMM
+            }
+            if let commandBufferPrefillQMM = options?.vendoredCommandBufferPrefillQMMEnabled {
+                metalConfiguration.useVendoredCommandBufferPrefillQMM = commandBufferPrefillQMM
+            }
+            if let singleCBPrefill = options?.singleCommandBufferPrefillEnabled {
+                metalConfiguration.useSingleCommandBufferPrefill = singleCBPrefill
+            }
+            if let singleCBDecode = options?.singleCommandBufferDecodeEnabled {
+                metalConfiguration.useSingleCommandBufferDecode = singleCBDecode
+            }
+            if let prefillLayerCB = options?.prefillLayerCommandBufferBatchingEnabled {
+                metalConfiguration.usePrefillLayerCommandBufferBatching = prefillLayerCB
+            }
+            if let fusedGDNDecode = options?.fusedGDNDecodeEnabled {
+                metalConfiguration.useFusedGDNDecode = fusedGDNDecode
+            }
+            if let cmlxFastRMSNorm = options?.cmlxFastRMSNormEnabled {
+                metalConfiguration.useCmlxFastRMSNorm = cmlxFastRMSNorm
+            }
+            if let cmlxLazyOutputHead = options?.cmlxLazyOutputHeadEnabled {
+                metalConfiguration.useCmlxLazyOutputHead = cmlxLazyOutputHead
+            }
+            if let greedyOutputHeadArgmax = options?.greedyOutputHeadArgmaxEnabled {
+                metalConfiguration.useGreedyOutputHeadArgmax = greedyOutputHeadArgmax
+            }
+            if let maxInFlight = options?.maxInFlightCommandBuffers {
+                metalConfiguration.maxInFlightCommandBuffers = maxInFlight
+            }
+            _ = NativeRuntimeBridge.applyMetalConfiguration(metalConfiguration)
+            nativeCmlxLimitState.reset()
             let runtime = try EdgeMetalRuntime(
                 configuration: EdgeEngineMetalConfigurationStore.shared.currentConfiguration
             )
@@ -302,6 +349,7 @@ public final class VLMEngine: ObservableObject {
         nativeVLMCmlxAttentionCacheQuantization = nil
         nativeVLMCmlxFrogJumpLayerMask = 0
         nativeVLMCmlxAttentionCacheLimit = nil
+        nativeCmlxLimitState.reset()
     }
 
     /// Clear prompt-cache ledger and re-mark the Cmlx session as alive with
@@ -387,6 +435,17 @@ public final class VLMEngine: ObservableObject {
         }
     }
 
+    private func applyNativeVLMCmlxCommandBufferLimits(contextLengthHint: Int) throws {
+        try NativeCmlxCommandBufferLimitApplier.apply(
+            contextLengthHint: contextLengthHint,
+            state: &nativeCmlxLimitState,
+            commandBufferDiagnosticName: "vlm_cmlx_command_buffer_limits",
+            memoryLimitDiagnosticName: "vlm_cmlx_memory_limit",
+            includeRequestedContext: true,
+            emitDiagnostic: { self.emitVLMDiagnostic($0) }
+        )
+    }
+
     private func generateNativeText(
         messages: [ChatMessage],
         tools: [ToolSpec]?,
@@ -465,7 +524,8 @@ public final class VLMEngine: ObservableObject {
                 planPrefillStepSize: currentPlan?.prefillStepSize,
                 memoryIntent: currentPlan?.memoryIntent ?? memoryPolicy?.memoryIntent ?? .balanced
             ),
-            staticPolicy: memoryPolicy
+            staticPolicy: memoryPolicy,
+            dsrMaxCriticalOverride: requestedParameters.dsrMaxCritical
         )
         resolved.apply(to: &parameters)
         lastPolicy = resolved
@@ -886,6 +946,9 @@ public final class VLMEngine: ObservableObject {
             try applyVLMCmlxEOSSamplingBias(generatedTokenCount: 0)
         }
         try Task.checkCancellation()
+        try applyNativeVLMCmlxCommandBufferLimits(
+            contextLengthHint: nativeVLMCmlxTokenIds.count + prefillTokens.count
+        )
         var nextTokenID: Int? = try runNativeVLMCmlxTokenPrefill(
             container: container,
             tokenIDs: prefillTokens,
@@ -1259,7 +1322,8 @@ public final class VLMEngine: ObservableObject {
                 planPrefillStepSize: currentPlan?.prefillStepSize,
                 memoryIntent: currentPlan?.memoryIntent ?? memoryPolicy?.memoryIntent ?? .balanced
             ),
-            staticPolicy: memoryPolicy
+            staticPolicy: memoryPolicy,
+            dsrMaxCriticalOverride: requestedParameters.dsrMaxCritical
         )
         resolved.apply(to: &parameters)
         lastPolicy = resolved
@@ -1287,6 +1351,12 @@ public final class VLMEngine: ObservableObject {
         )
 
         let attentionCacheLimit = parameters.maxKVSize ?? parameters.dsrMaxCritical ?? kvCapacity
+        try applyNativeVLMCmlxCommandBufferLimits(
+            contextLengthHint: promptTokens.count + parameters.maxTokens
+        )
+        emitVLMDiagnostic(
+            "vlm_cmlx_media_policy prompt=\(promptTokens.count) maxTokens=\(parameters.maxTokens) kvCapacity=\(kvCapacity) limit=\(attentionCacheLimit) useDSR=\(parameters.useDSR) dsrMax=\(parameters.dsrMaxCritical.map(String.init) ?? "nil") prefill=\(parameters.prefillStepSize) policy=\(resolved.reasoning)"
+        )
         try prepareNativeVLMCmlxSession(
             container: container,
             dsrPolicies: dsrPolicies,

@@ -148,8 +148,7 @@ public final class LLMEngine: ObservableObject {
     private var nativeCmlxLazyDecodeSessionDSRPolicies: [Int: QwenDSRKVCachePolicy] = [:]
     private var nativeCmlxLazyDecodeSessionAttentionCacheQuantization: NativeCmlxAttentionCacheQuantization?
     private var nativeCmlxLazyDecodeSessionFrogJumpLayerMask: UInt64 = 0
-    private var nativeLastCmlxCommandBufferLimits: (maxOps: Int, maxMB: Int)?
-    private var nativeLastCmlxMemoryLimitBytes: Int?
+    private var nativeCmlxLimitState = NativeCmlxCommandBufferLimitState()
     private var onlineCalibrator: OnlineCalibrator?
     private var activeOnlineCalibrationOverrides: OnlineCalibrator.CalibrationOverrides?
     private var nativeUseCmlxLazyDecode = false
@@ -1090,8 +1089,7 @@ public final class LLMEngine: ObservableObject {
         nativeCmlxLazyDecodeSessionDSRPolicies = [:]
         nativeCmlxLazyDecodeSessionAttentionCacheQuantization = nil
         nativeCmlxLazyDecodeSessionFrogJumpLayerMask = 0
-        nativeLastCmlxCommandBufferLimits = nil
-        nativeLastCmlxMemoryLimitBytes = nil
+        nativeCmlxLimitState.reset()
         onlineCalibrator = nil
         activeOnlineCalibrationOverrides = nil
         clearNativeGreedyDecodeSession()
@@ -1704,8 +1702,7 @@ public final class LLMEngine: ObservableObject {
         nativeCmlxLazyDecodeSessionDSRPolicies = [:]
         nativeCmlxLazyDecodeSessionAttentionCacheQuantization = nil
         nativeCmlxLazyDecodeSessionFrogJumpLayerMask = 0
-        nativeLastCmlxCommandBufferLimits = nil
-        nativeLastCmlxMemoryLimitBytes = nil
+        nativeCmlxLimitState.reset()
     }
 
     private func loadNativeModelFallback(
@@ -1719,8 +1716,7 @@ public final class LLMEngine: ObservableObject {
         nativeCmlxLazyDecodeSessionDSRPolicies = [:]
         nativeCmlxLazyDecodeSessionAttentionCacheQuantization = nil
         nativeCmlxLazyDecodeSessionFrogJumpLayerMask = 0
-        nativeLastCmlxCommandBufferLimits = nil
-        nativeLastCmlxMemoryLimitBytes = nil
+        nativeCmlxLimitState.reset()
         clearNativeGreedyDecodeSession()
         diagnosticSink?("native_fallback_model_load_begin")
         let executor = try MetalKernelExecutor(runtime: runtime)
@@ -2150,33 +2146,13 @@ public final class LLMEngine: ObservableObject {
     }
 
     private func applyCmlxCommandBufferLimits(contextLengthHint: Int) throws {
-        var configuration = NativeRuntimeBridge.currentMetalConfiguration
-        configuration.contextLengthHint = max(0, contextLengthHint)
-        let limits = (
-            maxOps: configuration.effectiveMaxOpsPerCommandBuffer,
-            maxMB: configuration.maxMBPerCommandBuffer
+        try NativeCmlxCommandBufferLimitApplier.apply(
+            contextLengthHint: contextLengthHint,
+            state: &nativeCmlxLimitState,
+            commandBufferDiagnosticName: "cmlx_lazy_command_buffer_limits",
+            memoryLimitDiagnosticName: "cmlx_lazy_memory_limit",
+            emitDiagnostic: diagnosticSink
         )
-        if nativeLastCmlxCommandBufferLimits?.maxOps == limits.maxOps,
-           nativeLastCmlxCommandBufferLimits?.maxMB == limits.maxMB {
-        } else {
-            try QwenCmlxLazyDecodeSession.configureCommandBufferLimits(
-                maxOps: limits.maxOps,
-                maxMB: limits.maxMB
-            )
-            nativeLastCmlxCommandBufferLimits = limits
-            diagnosticSink?(
-                "cmlx_lazy_command_buffer_limits maxOps=\(limits.maxOps) maxMB=\(limits.maxMB) ctx=\(max(0, contextLengthHint))"
-            )
-        }
-
-        if let memoryLimitBytes = configuration.memoryLimitBytes,
-           nativeLastCmlxMemoryLimitBytes != memoryLimitBytes {
-            try QwenCmlxLazyDecodeSession.configureMemoryLimit(bytes: memoryLimitBytes)
-            nativeLastCmlxMemoryLimitBytes = memoryLimitBytes
-            diagnosticSink?(
-                "cmlx_lazy_memory_limit memoryLimitMB=\(memoryLimitBytes / 1_048_576)"
-            )
-        }
     }
 
     private func runCmlxLazyGenerate(
@@ -2264,8 +2240,7 @@ public final class LLMEngine: ObservableObject {
             nativeCmlxLazyDecodeSessionDSRPolicies = [:]
             nativeCmlxLazyDecodeSessionAttentionCacheQuantization = nil
             nativeCmlxLazyDecodeSessionFrogJumpLayerMask = 0
-            nativeLastCmlxCommandBufferLimits = nil
-            nativeLastCmlxMemoryLimitBytes = nil
+            nativeCmlxLimitState.reset()
             diagnosticSink?("cmlx_lazy_session_init_begin")
             let created = try QwenCmlxLazyDecodeSession(
                 bundleIndex: bundleIndex,
@@ -2783,8 +2758,7 @@ public final class LLMEngine: ObservableObject {
         _ = NativeRuntimeBridge.applyMetalConfiguration(
             NativeRuntimeBridge.metalConfiguration(for: adjusted, contextLengthHint: contextLengthHint)
         )
-        nativeLastCmlxCommandBufferLimits = nil
-        nativeLastCmlxMemoryLimitBytes = nil
+        nativeCmlxLimitState.reset()
         activeOnlineCalibrationOverrides = overrides
         diagnosticSink?(
             "online_calibration_apply maxOps=\(overrides.maxOpsPerBuffer) prefill=\(overrides.prefillStepSize) dynFloor=\(overrides.dynamicOpsFloor) ctx=\(contextLengthHint)"
