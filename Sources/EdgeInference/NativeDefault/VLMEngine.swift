@@ -1146,6 +1146,59 @@ public final class VLMEngine: ObservableObject {
         throw QwenHybridModelReferenceError.emptyTokenIds
     }
 
+    private func runNativeVLMImageFeaturePrefill(
+        container: QwenVLMNativeContainer,
+        tokenIDs: [Int],
+        imageFeatures: [Float],
+        imageFeatureShape: [Int],
+        imageTokenID: Int,
+        parameters: EdgeGenerateParameters
+    ) throws -> Int {
+        let chunkSize = max(1, parameters.prefillStepSize)
+        guard tokenIDs.count > chunkSize,
+              let firstImageTokenIndex = tokenIDs.firstIndex(of: imageTokenID),
+              firstImageTokenIndex > chunkSize
+        else {
+            return try container.prefillImageFeatures(
+                tokenIDs: tokenIDs,
+                imageFeatures: imageFeatures,
+                imageFeatureShape: imageFeatureShape,
+                imageTokenID: imageTokenID
+            )
+        }
+
+        let prefixTokens = Array(tokenIDs[..<firstImageTokenIndex])
+        let mediaAndSuffixTokens = Array(tokenIDs[firstImageTokenIndex...])
+        let prefixChunkCount = Int(ceil(Double(prefixTokens.count) / Double(chunkSize)))
+        emitVLMDiagnostic(
+            "vlm_cmlx_media_prefill_chunked total=\(tokenIDs.count) prefix=\(prefixTokens.count) mediaSuffix=\(mediaAndSuffixTokens.count) step=\(chunkSize) prefixChunks=\(prefixChunkCount)"
+        )
+
+        var offset = 0
+        var chunkIndex = 0
+        while offset < prefixTokens.count {
+            let end = min(offset + chunkSize, prefixTokens.count)
+            let chunk = Array(prefixTokens[offset..<end])
+            chunkIndex += 1
+            try container.prefillCmlxTokensAsync(tokenIDs: chunk)
+            emitVLMDiagnostic(
+                "vlm_cmlx_media_prefill_prefix_chunk_done index=\(chunkIndex) tokens=\(chunk.count) final=false async=true"
+            )
+            offset = end
+        }
+
+        let nextTokenID = try container.prefillImageFeatures(
+            tokenIDs: mediaAndSuffixTokens,
+            imageFeatures: imageFeatures,
+            imageFeatureShape: imageFeatureShape,
+            imageTokenID: imageTokenID
+        )
+        emitVLMDiagnostic(
+            "vlm_cmlx_media_prefill_media_chunk_done tokens=\(mediaAndSuffixTokens.count) final=true"
+        )
+        return nextTokenID
+    }
+
     private func generateNativeImage(
         messages: [ChatMessage],
         inputs: [NativeVLMImageInput],
@@ -1247,6 +1300,13 @@ public final class VLMEngine: ObservableObject {
         NSLog("[VLM-MEM] imageTokenCounts=%@, pixelValues=%.1f MB", imageTokenCounts.description, Float(pixelValues.count * 4) / 1_048_576.0)
 
         try Task.checkCancellation()
+        if container.isCmlxDecoderLoaded {
+            releaseNativeVLMCmlxSession(
+                container: container,
+                reason: "media_generate_before_vision_load"
+            )
+            promptCache.clear()
+        }
         if container.isCmlxVisionLoaded {
             container.unloadCmlxVisionWeights()
         }
@@ -1371,11 +1431,13 @@ public final class VLMEngine: ObservableObject {
         nativeVLMCmlxContainsMediaContext = false
 
         try Task.checkCancellation()
-        var nextTokenID: Int? = try container.prefillImageFeatures(
+        var nextTokenID: Int? = try runNativeVLMImageFeaturePrefill(
+            container: container,
             tokenIDs: promptTokens,
             imageFeatures: visionEncoding.values,
             imageFeatureShape: visionEncoding.shape,
-            imageTokenID: imageTokenID
+            imageTokenID: imageTokenID,
+            parameters: parameters
         )
         let firstTokenAt = Date()
         var generatedTokenIds: [Int] = []
