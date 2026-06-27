@@ -1192,19 +1192,22 @@ public final class VLMEngine: ObservableObject {
         try container.loadCmlxVisionWeights()
         let afterVisionLoad = DeviceProfile.captureMemorySnapshot().footprintMB
         NSLog("[VLM-MEM] after vision encoder load: %.0f MB (+%.0f)", afterVisionLoad, afterVisionLoad - beforeVision)
-        defer {
-            container.unloadCmlxVisionWeights()
-            let afterUnload = DeviceProfile.captureMemorySnapshot().footprintMB
-            NSLog("[VLM-MEM] after vision encoder unload: %.0f MB", afterUnload)
-        }
 
-        let visionEncoding = try container.visionEncode(
-            pixelValues: pixelValues,
-            pixelValuesShape: [totalPatchCount, patchDim],
-            gridTHW: grids
-        )
-        let afterVisionEncode = DeviceProfile.captureMemorySnapshot().footprintMB
-        NSLog("[VLM-MEM] after vision encode: %.0f MB (+%.0f from load)", afterVisionEncode, afterVisionEncode - afterVisionLoad)
+        let visionEncoding: EdgeMLXQwen35VisionEncoding
+        do {
+            defer {
+                container.unloadCmlxVisionWeights()
+                let afterUnload = DeviceProfile.captureMemorySnapshot().footprintMB
+                NSLog("[VLM-MEM] after vision encoder unload: %.0f MB", afterUnload)
+            }
+            visionEncoding = try container.visionEncode(
+                pixelValues: pixelValues,
+                pixelValuesShape: [totalPatchCount, patchDim],
+                gridTHW: grids
+            )
+            let afterVisionEncode = DeviceProfile.captureMemorySnapshot().footprintMB
+            NSLog("[VLM-MEM] after vision encode: %.0f MB (+%.0f from load)", afterVisionEncode, afterVisionEncode - afterVisionLoad)
+        }
         let totalImageTokenCount = imageTokenCounts.reduce(0, +)
         guard totalImageTokenCount > 0,
               visionEncoding.shape.first == totalImageTokenCount
