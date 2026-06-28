@@ -1290,12 +1290,19 @@ public final class VLMEngine: ObservableObject {
               let firstImageTokenIndex = tokenIDs.firstIndex(of: imageTokenID),
               firstImageTokenIndex > chunkSize
         else {
-            return try container.prefillImageFeatures(
+            emitVLMDiagnostic(
+                "vlm_cmlx_media_prefill_direct_begin tokens=\(tokenIDs.count) imageFeatures=\(imageFeatureShape)"
+            )
+            let nextTokenID = try container.prefillImageFeatures(
                 tokenIDs: tokenIDs,
                 imageFeatures: imageFeatures,
                 imageFeatureShape: imageFeatureShape,
                 imageTokenID: imageTokenID
             )
+            emitVLMDiagnostic(
+                "vlm_cmlx_media_prefill_direct_done tokens=\(tokenIDs.count)"
+            )
+            return nextTokenID
         }
 
         let prefixTokens = Array(tokenIDs[..<firstImageTokenIndex])
@@ -1318,6 +1325,9 @@ public final class VLMEngine: ObservableObject {
             offset = end
         }
 
+        emitVLMDiagnostic(
+            "vlm_cmlx_media_prefill_media_chunk_begin tokens=\(mediaAndSuffixTokens.count) imageFeatures=\(imageFeatureShape)"
+        )
         let nextTokenID = try container.prefillImageFeatures(
             tokenIDs: mediaAndSuffixTokens,
             imageFeatures: imageFeatures,
@@ -1724,6 +1734,9 @@ public final class VLMEngine: ObservableObject {
             imageFeatureShape: visionEncoding.shape,
             imageTokenID: imageTokenID,
             parameters: parameters
+        )
+        emitVLMDiagnostic(
+            "vlm_cmlx_media_first_token_ready tokenAvailable=\(nextTokenID != nil)"
         )
         let firstTokenAt = Date()
         var generatedTokenIds: [Int] = []
