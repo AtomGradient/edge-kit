@@ -70,6 +70,91 @@ final class PromptCacheTests: XCTestCase {
         XCTAssertEqual(match, .init(cachedTokenLength: 3, promptTokenLength: 3))
     }
 
+    func testNativeVLMImageAppendPlannerBuildsMediaSuffix() {
+        let imageTokenID = 248_056
+        let result = VLMEngine.NativeVLMImageAppendPlanner.makePlan(
+            cachedTokenIds: Array(0..<8),
+            currentPromptTokenIds: [],
+            skippableCachedTokenSequences: [],
+            previousPromptMessages: [
+                .system("system"),
+                .user("first image question"),
+            ],
+            lastAssistantText: "first answer",
+            currentMediaPromptMessages: [
+                .system("system"),
+                .user("first image question"),
+                .assistant("first answer"),
+                .user("<|vision_start|><|image_pad|><|image_pad|><|vision_end|>second image question"),
+            ],
+            imageTokenID: imageTokenID,
+            totalImageTokenCount: 2,
+            enableThinking: false,
+            encodeSuffix: { text in
+                let imageCount = text.components(separatedBy: "<|image_pad|>").count - 1
+                return [10] + Array(repeating: imageTokenID, count: imageCount) + [11]
+            }
+        )
+
+        XCTAssertEqual(
+            result,
+            .success(.init(
+                cachedTokensReused: 8,
+                suffixTokenIds: [10, imageTokenID, imageTokenID, 11]
+            ))
+        )
+    }
+
+    func testNativeVLMImageAppendPlannerRejectsImageTokenMismatch() {
+        let imageTokenID = 248_056
+        let result = VLMEngine.NativeVLMImageAppendPlanner.makePlan(
+            cachedTokenIds: Array(0..<8),
+            currentPromptTokenIds: [],
+            skippableCachedTokenSequences: [],
+            previousPromptMessages: [.user("first")],
+            lastAssistantText: "answer",
+            currentMediaPromptMessages: [
+                .user("first"),
+                .assistant("answer"),
+                .user("<|vision_start|><|image_pad|><|vision_end|>second"),
+            ],
+            imageTokenID: imageTokenID,
+            totalImageTokenCount: 2,
+            enableThinking: false,
+            encodeSuffix: { _ in [imageTokenID] }
+        )
+
+        XCTAssertEqual(
+            result,
+            .failure("text_suffix_image_token_count_mismatch suffix=1 expected=2")
+        )
+    }
+
+    func testNativeVLMImageAppendPlannerPrefersTokenPrefixWhenAvailable() {
+        let imageTokenID = 248_056
+        let cachedTokens = [1, 2, 3]
+        let result = VLMEngine.NativeVLMImageAppendPlanner.makePlan(
+            cachedTokenIds: cachedTokens,
+            currentPromptTokenIds: cachedTokens + [4, imageTokenID, imageTokenID, 5],
+            skippableCachedTokenSequences: [],
+            previousPromptMessages: [.user("stale")],
+            lastAssistantText: "stale answer",
+            currentMediaPromptMessages: [.user("stale")],
+            imageTokenID: imageTokenID,
+            totalImageTokenCount: 2,
+            enableThinking: false,
+            encodeSuffix: { _ in [] }
+        )
+
+        XCTAssertEqual(
+            result,
+            .success(.init(
+                cachedTokensReused: 3,
+                suffixTokenIds: [4, imageTokenID, imageTokenID, 5]
+            ))
+        )
+    }
+
     func testQwenIncrementalSuffixRendersNewUserAfterGeneratedAssistant() {
         let suffix = NativePromptSessionReuse.qwenIncrementalSuffixText(
             previousPromptMessages: [

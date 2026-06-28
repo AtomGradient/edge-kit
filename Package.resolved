@@ -1,15 +1,6 @@
 {
   "pins" : [
     {
-      "identity" : "edge-engine",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/AtomGradient/edge-engine.git",
-      "state" : {
-        "revision" : "ada98f4beabbaec7c84b5f0dc76f242d82227f47",
-        "version" : "1.0.0-rc141"
-      }
-    },
-    {
       "identity" : "eventsource",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/mattt/EventSource.git",

@@ -82,6 +82,95 @@ public final class VLMEngine: ObservableObject {
         }
     }
 
+    struct NativeVLMImageAppendPlan: Equatable {
+        let cachedTokensReused: Int
+        let suffixTokenIds: [Int]
+    }
+
+    enum NativeVLMImageAppendPlanResult: Equatable {
+        case success(NativeVLMImageAppendPlan)
+        case failure(String)
+    }
+
+    enum NativeVLMImageAppendPlanner {
+        static func makePlan(
+            cachedTokenIds: [Int],
+            currentPromptTokenIds: [Int],
+            skippableCachedTokenSequences: [[Int]],
+            previousPromptMessages: [ChatMessage],
+            lastAssistantText: String,
+            currentMediaPromptMessages: [ChatMessage],
+            imageTokenID: Int,
+            totalImageTokenCount: Int,
+            enableThinking: Bool,
+            encodeSuffix: (String) -> [Int]
+        ) -> NativeVLMImageAppendPlanResult {
+            guard !cachedTokenIds.isEmpty else {
+                return .failure("empty_cached_tokens")
+            }
+            guard totalImageTokenCount > 0 else {
+                return .failure("empty_image_tokens")
+            }
+            if let reusablePrefix = NativePromptSessionReuse.reusablePrefixMatch(
+                cachedTokenIds: cachedTokenIds,
+                promptTokenIds: currentPromptTokenIds,
+                skippableCachedTokenSequences: skippableCachedTokenSequences
+            ) {
+                let suffixTokenIds = Array(currentPromptTokenIds.dropFirst(reusablePrefix.promptTokenLength))
+                return validate(
+                    suffixTokenIds: suffixTokenIds,
+                    cachedTokensReused: reusablePrefix.cachedTokenLength,
+                    imageTokenID: imageTokenID,
+                    totalImageTokenCount: totalImageTokenCount,
+                    reasonPrefix: "token_prefix"
+                )
+            }
+            switch NativePromptSessionReuse.qwenIncrementalSuffix(
+                previousPromptMessages: previousPromptMessages,
+                lastAssistantText: lastAssistantText,
+                currentMessages: currentMediaPromptMessages,
+                enableThinking: enableThinking,
+                matchPath: "vlm_image_append_suffix"
+            ) {
+            case .match(let suffixText):
+                let suffixTokenIds = encodeSuffix(suffixText)
+                return validate(
+                    suffixTokenIds: suffixTokenIds,
+                    cachedTokensReused: cachedTokenIds.count,
+                    imageTokenID: imageTokenID,
+                    totalImageTokenCount: totalImageTokenCount,
+                    reasonPrefix: "text_suffix"
+                )
+            case .reject(let reason):
+                return .failure(reason)
+            }
+        }
+
+        private static func validate(
+            suffixTokenIds: [Int],
+            cachedTokensReused: Int,
+            imageTokenID: Int,
+            totalImageTokenCount: Int,
+            reasonPrefix: String
+        ) -> NativeVLMImageAppendPlanResult {
+            guard !suffixTokenIds.isEmpty else {
+                return .failure("\(reasonPrefix)_empty_suffix_tokens")
+            }
+            let imagePlaceholderCount = suffixTokenIds.reduce(0) { count, token in
+                count + (token == imageTokenID ? 1 : 0)
+            }
+            guard imagePlaceholderCount == totalImageTokenCount else {
+                return .failure(
+                    "\(reasonPrefix)_image_token_count_mismatch suffix=\(imagePlaceholderCount) expected=\(totalImageTokenCount)"
+                )
+            }
+            return .success(NativeVLMImageAppendPlan(
+                cachedTokensReused: cachedTokensReused,
+                suffixTokenIds: suffixTokenIds
+            ))
+        }
+    }
+
     public init() {}
 
     public func loadLocal(directory: URL, onProgress: ((Double) -> Void)? = nil) async throws {
@@ -337,6 +426,25 @@ public final class VLMEngine: ObservableObject {
     private func emitVLMDiagnostic(_ message: String) {
         diagnosticSink?(message)
         NSLog("[VLM] %@", message)
+    }
+
+    private nonisolated static func environmentBool(
+        _ name: String,
+        defaultValue: Bool = false
+    ) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else {
+            return defaultValue
+        }
+        switch raw.lowercased() {
+        case "1", "true", "yes", "on":
+            return true
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return defaultValue
+        }
     }
 
     private func resetNativeVLMCmlxLedger() {
@@ -797,6 +905,29 @@ public final class VLMEngine: ObservableObject {
             return false
         }
 
+        if hadMatchingSession,
+           Self.environmentBool("EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_TEXT_SMOKE_EXPERIMENT") {
+            let beforeSummary = (try? container.cmlxDecoderMemorySummary()) ?? "unavailable"
+            emitVLMDiagnostic("vlm_scheme_d_text_smoke_unload_begin \(beforeSummary)")
+            do {
+                try container.unloadCmlxDecoderWeightsPreservingState()
+                let afterUnloadSummary = (try? container.cmlxDecoderMemorySummary()) ?? "unavailable"
+                emitVLMDiagnostic("vlm_scheme_d_text_smoke_unload_done \(afterUnloadSummary)")
+                try container.reloadCmlxDecoderWeightsPreservingState()
+                let afterReloadSummary = (try? container.cmlxDecoderMemorySummary()) ?? "unavailable"
+                emitVLMDiagnostic("vlm_scheme_d_text_smoke_reload_done \(afterReloadSummary)")
+            } catch {
+                emitVLMDiagnostic(
+                    "vlm_cmlx_text_reject reason=scheme_d_text_smoke_failed error=\(error)"
+                )
+                releaseNativeVLMCmlxSession(
+                    container: container,
+                    reason: "scheme_d_text_smoke_failed"
+                )
+                return false
+            }
+        }
+
         var prefillTokens = promptTokens
         var cachedTokensReused = 0
         var promptCacheHit = false
@@ -1255,6 +1386,7 @@ public final class VLMEngine: ObservableObject {
         let startedAt = Date()
         let memoryBefore = DeviceProfile.captureMemorySnapshot().footprintMB
         NSLog("[VLM-MEM] image generate start: %.0f MB", memoryBefore)
+        emitVLMDiagnostic("vlm_mem image_generate_start mb=\(memoryBefore)")
 
         var imageProcessorConfig = container.index.preflightResult.plan.imageProcessorConfiguration
         let deviceRAMGB = DeviceProfile.current.totalRAMGB
@@ -1282,12 +1414,18 @@ public final class VLMEngine: ObservableObject {
         }
         let afterPreprocess = DeviceProfile.captureMemorySnapshot().footprintMB
         NSLog("[VLM-MEM] after image preprocess: %.0f MB (+%.0f)", afterPreprocess, afterPreprocess - memoryBefore)
+        emitVLMDiagnostic(
+            "vlm_mem after_image_preprocess mb=\(afterPreprocess) delta=\(afterPreprocess - memoryBefore)"
+        )
 
         let patchDim = try Self.patchDimension(preprocessings)
         let totalPatchCount = preprocessings.reduce(0) { partial, item in
             partial + item.pixelValuesShape[0]
         }
         NSLog("[VLM-MEM] patches=%d patchDim=%d grids=%@", totalPatchCount, patchDim, preprocessings.map(\.imageGridTHW).description)
+        emitVLMDiagnostic(
+            "vlm_mem image_patches patches=\(totalPatchCount) patchDim=\(patchDim) grids=\(preprocessings.map(\.imageGridTHW).description)"
+        )
         let pixelValues = preprocessings.reduce(into: [Float]()) { result, item in
             result.reserveCapacity(result.count + item.pixelValues.count)
             result.append(contentsOf: item.pixelValues)
@@ -1298,46 +1436,14 @@ public final class VLMEngine: ObservableObject {
             plan: container.index.preflightResult.plan
         )
         NSLog("[VLM-MEM] imageTokenCounts=%@, pixelValues=%.1f MB", imageTokenCounts.description, Float(pixelValues.count * 4) / 1_048_576.0)
+        emitVLMDiagnostic(
+            "vlm_mem image_tokens counts=\(imageTokenCounts) pixelValuesMB=\(String(format: "%.1f", Float(pixelValues.count * 4) / 1_048_576.0))"
+        )
 
-        try Task.checkCancellation()
-        if container.isCmlxDecoderLoaded {
-            releaseNativeVLMCmlxSession(
-                container: container,
-                reason: "media_generate_before_vision_load"
-            )
-            promptCache.clear()
-        }
-        if container.isCmlxVisionLoaded {
-            container.unloadCmlxVisionWeights()
-        }
-        let beforeVision = DeviceProfile.captureMemorySnapshot().footprintMB
-        NSLog("[VLM-MEM] before vision encoder load: %.0f MB", beforeVision)
-        try container.loadCmlxVisionWeights()
-        let afterVisionLoad = DeviceProfile.captureMemorySnapshot().footprintMB
-        NSLog("[VLM-MEM] after vision encoder load: %.0f MB (+%.0f)", afterVisionLoad, afterVisionLoad - beforeVision)
-
-        let visionEncoding: EdgeMLXQwen35VisionEncoding
-        do {
-            defer {
-                container.unloadCmlxVisionWeights()
-                let afterUnload = DeviceProfile.captureMemorySnapshot().footprintMB
-                NSLog("[VLM-MEM] after vision encoder unload: %.0f MB", afterUnload)
-            }
-            visionEncoding = try container.visionEncode(
-                pixelValues: pixelValues,
-                pixelValuesShape: [totalPatchCount, patchDim],
-                gridTHW: grids
-            )
-            let afterVisionEncode = DeviceProfile.captureMemorySnapshot().footprintMB
-            NSLog("[VLM-MEM] after vision encode: %.0f MB (+%.0f from load)", afterVisionEncode, afterVisionEncode - afterVisionLoad)
-        }
+        let preserveStateUnloadWeightsExperiment = Self.environmentBool(
+            "EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_EXPERIMENT"
+        )
         let totalImageTokenCount = imageTokenCounts.reduce(0, +)
-        guard totalImageTokenCount > 0,
-              visionEncoding.shape.first == totalImageTokenCount
-        else {
-            throw EdgeRuntimeError.loadFailed("Native VLM vision encoder returned no image tokens")
-        }
-
         let imageTokenID = try Self.tokenID(
             "<|image_pad|>",
             tokenizer: tokenizer,
@@ -1345,6 +1451,10 @@ public final class VLMEngine: ObservableObject {
         )
         let promptMessages = messages.promptCacheMessages(
             preserveThinking: requestedParameters.preserveThinking
+        )
+        let mediaPromptMessages = try Self.makeNativeVLMImagePromptMessages(
+            messages: promptMessages,
+            imageTokenCounts: imageTokenCounts
         )
         let promptTokens = try Self.makeNativeVLMPromptTokens(
             messages: promptMessages,
@@ -1356,7 +1466,9 @@ public final class VLMEngine: ObservableObject {
         let placeholderCount = promptTokens.reduce(0) { count, token in
             count + (token == imageTokenID ? 1 : 0)
         }
-        guard placeholderCount == totalImageTokenCount else {
+        guard totalImageTokenCount > 0,
+              placeholderCount == totalImageTokenCount
+        else {
             throw EdgeRuntimeError.loadFailed(
                 "Native VLM prompt image token count mismatch: prompt=\(placeholderCount), features=\(totalImageTokenCount)"
             )
@@ -1375,7 +1487,7 @@ public final class VLMEngine: ObservableObject {
             snapshot: snapshot,
             context: InferencePolicy.TurnContext(
                 turn: turn,
-                cachedTokenCount: 0,
+                cachedTokenCount: preserveStateUnloadWeightsExperiment ? nativeVLMCmlxTokenIds.count : 0,
                 archInfo: arch,
                 scene: parameters.dsrScene,
                 requestedMaxTokens: parameters.maxTokens,
@@ -1409,10 +1521,169 @@ public final class VLMEngine: ObservableObject {
             requestedEnabled: parameters.frogJumpEnabled,
             thinkingEnabled: parameters.enableThinking
         )
-
         let attentionCacheLimit = parameters.maxKVSize ?? parameters.dsrMaxCritical ?? kvCapacity
+
+        var didUnloadDecoderWeightsPreservingState = false
+        var appendPlan: NativeVLMImageAppendPlan?
+        func emitCmlxDecoderMemorySummary(_ label: String) {
+            if let summary = try? container.cmlxDecoderMemorySummary() {
+                emitVLMDiagnostic("vlm_cmlx_memory_summary label=\(label) \(summary)")
+            } else {
+                emitVLMDiagnostic("vlm_cmlx_memory_summary label=\(label) unavailable")
+            }
+        }
+
+        try Task.checkCancellation()
+        if container.isCmlxDecoderLoaded {
+            if preserveStateUnloadWeightsExperiment {
+                let canReuseSession = nativeVLMCmlxSessionMatches(
+                    dsrPolicies: dsrPolicies,
+                    attentionQuantization: attentionQuantization,
+                    frogJumpMask: frogJumpMask,
+                    attentionCacheLimit: attentionCacheLimit
+                )
+                let planResult: NativeVLMImageAppendPlanResult
+                if !(tools?.isEmpty ?? true) {
+                    planResult = .failure("tools_present")
+                } else if canReuseSession {
+                    planResult = NativeVLMImageAppendPlanner.makePlan(
+                        cachedTokenIds: nativeVLMCmlxTokenIds,
+                        currentPromptTokenIds: promptTokens,
+                        skippableCachedTokenSequences: LLMEngine.qwenThinkingSentinelTokenSequences(
+                            tokenizer: tokenizer
+                        ),
+                        previousPromptMessages: nativeVLMCmlxPromptMessages,
+                        lastAssistantText: nativeVLMCmlxLastAssistantText,
+                        currentMediaPromptMessages: mediaPromptMessages,
+                        imageTokenID: imageTokenID,
+                        totalImageTokenCount: totalImageTokenCount,
+                        enableThinking: parameters.enableThinking,
+                        encodeSuffix: { text in
+                            tokenizer.encode(text: text, addSpecialTokens: false)
+                        }
+                    )
+                } else {
+                    planResult = .failure("session_config_mismatch")
+                }
+
+                switch planResult {
+                case .success(let plan):
+                    appendPlan = plan
+                    emitVLMDiagnostic(
+                        "vlm_scheme_d_append_plan_hit cached=\(plan.cachedTokensReused) suffix=\(plan.suffixTokenIds.count) fullPrompt=\(promptTokens.count)"
+                    )
+                    emitVLMDiagnostic(
+                        "vlm_scheme_d_unload_begin reason=media_append_before_vision_load"
+                    )
+                    emitCmlxDecoderMemorySummary("scheme_d_before_unload")
+                    do {
+                        try container.unloadCmlxDecoderWeightsPreservingState()
+                        didUnloadDecoderWeightsPreservingState = true
+                        emitCmlxDecoderMemorySummary("scheme_d_after_unload")
+                        emitVLMDiagnostic("vlm_scheme_d_unload_done")
+                    } catch {
+                        appendPlan = nil
+                        emitVLMDiagnostic(
+                            "vlm_scheme_d_fallback reason=unload_failed error=\(error)"
+                        )
+                        releaseNativeVLMCmlxSession(
+                            container: container,
+                            reason: "scheme_d_unload_failed"
+                        )
+                        promptCache.clear()
+                    }
+                case .failure(let reason):
+                    emitVLMDiagnostic(
+                        "vlm_scheme_d_fallback reason=\(reason)"
+                    )
+                    releaseNativeVLMCmlxSession(
+                        container: container,
+                        reason: "scheme_d_append_plan_failed"
+                    )
+                    promptCache.clear()
+                }
+            } else if Self.environmentBool("EDGE_VLM_PRESERVE_DECODER_FOR_VISION_EXPERIMENT") {
+                emitVLMDiagnostic(
+                    "vlm_cmlx_session_preserve reason=media_generate_before_vision_load_experiment"
+                )
+            } else {
+                releaseNativeVLMCmlxSession(
+                    container: container,
+                    reason: "media_generate_before_vision_load"
+                )
+                promptCache.clear()
+            }
+        }
+        if container.isCmlxVisionLoaded {
+            container.unloadCmlxVisionWeights()
+        }
+        let beforeVision = DeviceProfile.captureMemorySnapshot().footprintMB
+        NSLog("[VLM-MEM] before vision encoder load: %.0f MB", beforeVision)
+        emitVLMDiagnostic(
+            "vlm_mem before_vision_encoder_load mb=\(beforeVision) deltaFromStart=\(beforeVision - memoryBefore)"
+        )
+        try container.loadCmlxVisionWeights(
+            diagnosticSink: { [weak self] marker in
+                self?.emitVLMDiagnostic(marker)
+            }
+        )
+        let afterVisionLoad = DeviceProfile.captureMemorySnapshot().footprintMB
+        NSLog("[VLM-MEM] after vision encoder load: %.0f MB (+%.0f)", afterVisionLoad, afterVisionLoad - beforeVision)
+        emitVLMDiagnostic(
+            "vlm_mem after_vision_encoder_load mb=\(afterVisionLoad) delta=\(afterVisionLoad - beforeVision)"
+        )
+
+        let visionEncoding: EdgeMLXQwen35VisionEncoding
+        do {
+            defer {
+                container.unloadCmlxVisionWeights()
+                let afterUnload = DeviceProfile.captureMemorySnapshot().footprintMB
+                NSLog("[VLM-MEM] after vision encoder unload: %.0f MB", afterUnload)
+                emitVLMDiagnostic(
+                    "vlm_mem after_vision_encoder_unload mb=\(afterUnload) deltaFromStart=\(afterUnload - memoryBefore)"
+                )
+            }
+            visionEncoding = try container.visionEncode(
+                pixelValues: pixelValues,
+                pixelValuesShape: [totalPatchCount, patchDim],
+                gridTHW: grids
+            )
+            let afterVisionEncode = DeviceProfile.captureMemorySnapshot().footprintMB
+            NSLog("[VLM-MEM] after vision encode: %.0f MB (+%.0f from load)", afterVisionEncode, afterVisionEncode - afterVisionLoad)
+            emitVLMDiagnostic(
+                "vlm_mem after_vision_encode mb=\(afterVisionEncode) deltaFromVisionLoad=\(afterVisionEncode - afterVisionLoad)"
+            )
+        }
+        guard visionEncoding.shape.first == totalImageTokenCount
+        else {
+            throw EdgeRuntimeError.loadFailed("Native VLM vision encoder returned no image tokens")
+        }
+
+        if didUnloadDecoderWeightsPreservingState {
+            emitVLMDiagnostic("vlm_scheme_d_reload_begin")
+            emitCmlxDecoderMemorySummary("scheme_d_before_reload")
+            do {
+                try container.reloadCmlxDecoderWeightsPreservingState()
+                emitCmlxDecoderMemorySummary("scheme_d_after_reload")
+                emitVLMDiagnostic("vlm_scheme_d_reload_done")
+            } catch {
+                emitVLMDiagnostic(
+                    "vlm_scheme_d_fallback reason=reload_failed error=\(error)"
+                )
+                releaseNativeVLMCmlxSession(
+                    container: container,
+                    reason: "scheme_d_reload_failed"
+                )
+                promptCache.clear()
+                didUnloadDecoderWeightsPreservingState = false
+                appendPlan = nil
+            }
+        }
+
         try applyNativeVLMCmlxCommandBufferLimits(
-            contextLengthHint: promptTokens.count + parameters.maxTokens
+            contextLengthHint: (appendPlan?.cachedTokensReused ?? 0) +
+                (appendPlan?.suffixTokenIds.count ?? promptTokens.count) +
+                parameters.maxTokens
         )
         emitVLMDiagnostic(
             "vlm_cmlx_media_policy prompt=\(promptTokens.count) maxTokens=\(parameters.maxTokens) kvCapacity=\(kvCapacity) limit=\(attentionCacheLimit) useDSR=\(parameters.useDSR) dsrMax=\(parameters.dsrMaxCritical.map(String.init) ?? "nil") prefill=\(parameters.prefillStepSize) policy=\(resolved.reasoning)"
@@ -1424,16 +1695,31 @@ public final class VLMEngine: ObservableObject {
             frogJumpMask: frogJumpMask,
             attentionCacheLimit: attentionCacheLimit
         )
-        _ = try container.resetCmlxDecoder()
-        nativeVLMCmlxTokenIds = []
-        nativeVLMCmlxPromptMessages = []
-        nativeVLMCmlxLastAssistantText = ""
-        nativeVLMCmlxContainsMediaContext = false
+        let prefillTokenIds: [Int]
+        let promptCacheHit: Bool
+        let cachedTokensReused: Int
+        if let appendPlan {
+            prefillTokenIds = appendPlan.suffixTokenIds
+            promptCacheHit = true
+            cachedTokensReused = appendPlan.cachedTokensReused
+            emitVLMDiagnostic(
+                "vlm_scheme_d_append_prefill_begin cached=\(cachedTokensReused) suffix=\(prefillTokenIds.count) fullPrompt=\(promptTokens.count)"
+            )
+        } else {
+            _ = try container.resetCmlxDecoder()
+            nativeVLMCmlxTokenIds = []
+            nativeVLMCmlxPromptMessages = []
+            nativeVLMCmlxLastAssistantText = ""
+            nativeVLMCmlxContainsMediaContext = false
+            prefillTokenIds = promptTokens
+            promptCacheHit = false
+            cachedTokensReused = 0
+        }
 
         try Task.checkCancellation()
         var nextTokenID: Int? = try runNativeVLMImageFeaturePrefill(
             container: container,
-            tokenIDs: promptTokens,
+            tokenIDs: prefillTokenIds,
             imageFeatures: visionEncoding.values,
             imageFeatureShape: visionEncoding.shape,
             imageTokenID: imageTokenID,
@@ -1478,12 +1764,17 @@ public final class VLMEngine: ObservableObject {
         let decodeSeconds = max(endedAt.timeIntervalSince(firstTokenAt), 0.001)
         let memoryAfter = DeviceProfile.captureMemorySnapshot().footprintMB
         turnCounter = turn
-        nativeVLMCmlxTokenIds = promptTokens + generatedTokenIds
+        if appendPlan != nil {
+            nativeVLMCmlxTokenIds.append(contentsOf: prefillTokenIds)
+            nativeVLMCmlxTokenIds.append(contentsOf: generatedTokenIds)
+        } else {
+            nativeVLMCmlxTokenIds = promptTokens + generatedTokenIds
+        }
         nativeVLMCmlxPromptMessages = promptMessages
         nativeVLMCmlxLastAssistantText = NativePromptSessionReuse.normalizeAssistantText(emittedText)
         nativeVLMCmlxContainsMediaContext = true
         emitVLMDiagnostic(
-            "vlm_cmlx_media_session_seeded prompt=\(promptTokens.count) generated=\(generatedTokenIds.count) total=\(nativeVLMCmlxTokenIds.count)"
+            "vlm_cmlx_media_session_seeded prompt=\(promptTokens.count) prefill=\(prefillTokenIds.count) generated=\(generatedTokenIds.count) total=\(nativeVLMCmlxTokenIds.count) append=\(appendPlan != nil)"
         )
         promptCache.update(
             cache: [],
@@ -1499,8 +1790,8 @@ public final class VLMEngine: ObservableObject {
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
             policyReasoning: resolved.reasoning + " | nativeVLMImageCmlx=on",
-            promptCacheHit: false,
-            cachedTokensReused: 0,
+            promptCacheHit: promptCacheHit,
+            cachedTokensReused: cachedTokensReused,
             thermalState: ThermalManager().level.rawValue,
             turn: turn
         )
@@ -1569,6 +1860,27 @@ public final class VLMEngine: ObservableObject {
         tools: [ToolSpec]?,
         parameters: EdgeGenerateParameters
     ) throws -> [Int] {
+        let promptMessages = try makeNativeVLMImagePromptMessages(
+            messages: messages,
+            imageTokenCounts: imageTokenCounts
+        )
+        let tokens = try tokenizer.applyChatTemplate(
+            messages: promptMessages.chatTemplateMessages(
+                preserveThinking: parameters.preserveThinking
+            ),
+            tools: tools,
+            additionalContext: LLMEngine.chatTemplateContext(parameters: parameters)
+        )
+        guard !tokens.isEmpty else {
+            throw QwenHybridModelReferenceError.emptyTokenIds
+        }
+        return tokens
+    }
+
+    private static func makeNativeVLMImagePromptMessages(
+        messages: [ChatMessage],
+        imageTokenCounts: [Int]
+    ) throws -> [ChatMessage] {
         guard !imageTokenCounts.isEmpty,
               imageTokenCounts.allSatisfy({ $0 > 0 })
         else {
@@ -1588,17 +1900,7 @@ public final class VLMEngine: ObservableObject {
         } else {
             promptMessages.append(.user(visionBlock))
         }
-        let tokens = try tokenizer.applyChatTemplate(
-            messages: promptMessages.chatTemplateMessages(
-                preserveThinking: parameters.preserveThinking
-            ),
-            tools: tools,
-            additionalContext: LLMEngine.chatTemplateContext(parameters: parameters)
-        )
-        guard !tokens.isEmpty else {
-            throw QwenHybridModelReferenceError.emptyTokenIds
-        }
-        return tokens
+        return promptMessages
     }
 
     private static func frogJumpLayerMask(
