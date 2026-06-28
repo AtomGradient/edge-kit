@@ -125,6 +125,58 @@ final class VLMEngineNativeTests: XCTestCase {
         ])
     }
 
+    func testVLMImagePolicySettingsUseBalancedByDefault() {
+        let settings = VLMEngine.nativeVLMImagePolicySettings(
+            for: .balanced,
+            environment: [:]
+        )
+
+        XCTAssertEqual(settings.maxImageTokens, 256)
+        XCTAssertNil(settings.pruneTokens)
+        XCTAssertFalse(settings.maxImageTokensOverriddenByEnvironment)
+        XCTAssertFalse(settings.pruneTokensOverriddenByEnvironment)
+    }
+
+    func testVLMImagePolicySettingsUseFastResizeAndPrune() {
+        let settings = VLMEngine.nativeVLMImagePolicySettings(
+            for: .fast,
+            environment: [:]
+        )
+
+        XCTAssertEqual(settings.maxImageTokens, 130)
+        XCTAssertEqual(settings.pruneTokens, 64)
+    }
+
+    func testVLMImagePolicySettingsHonorEnvironmentOverrides() {
+        let settings = VLMEngine.nativeVLMImagePolicySettings(
+            for: .balanced,
+            environment: [
+                "EDGE_VLM_IMAGE_TOKEN_BUDGET": "130",
+                "EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS": "64",
+            ]
+        )
+
+        XCTAssertEqual(settings.maxImageTokens, 130)
+        XCTAssertEqual(settings.pruneTokens, 64)
+        XCTAssertTrue(settings.maxImageTokensOverriddenByEnvironment)
+        XCTAssertTrue(settings.pruneTokensOverriddenByEnvironment)
+    }
+
+    func testVLMImagePolicySettingsCanDisablePolicyWithZeroEnvironmentOverrides() {
+        let settings = VLMEngine.nativeVLMImagePolicySettings(
+            for: .fast,
+            environment: [
+                "EDGE_VLM_IMAGE_TOKEN_BUDGET": "0",
+                "EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS": "0",
+            ]
+        )
+
+        XCTAssertNil(settings.maxImageTokens)
+        XCTAssertNil(settings.pruneTokens)
+        XCTAssertTrue(settings.maxImageTokensOverriddenByEnvironment)
+        XCTAssertTrue(settings.pruneTokensOverriddenByEnvironment)
+    }
+
     @MainActor
     func testNativeImageGeneratePizzaSmokeWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment[Self.smokeGate] == "1" else {

@@ -7,6 +7,34 @@ import EdgeEngine
 import Foundation
 import Tokenizers
 
+public enum VLMImagePolicy: Sendable, Equatable {
+    /// Preserves more visual detail for OCR, documents, small objects, and charts.
+    case quality
+    /// Balanced latency and detail for everyday photos and scene understanding.
+    case balanced
+    /// Prioritizes low TTFT for simple scene previews and follow-up chat.
+    case fast
+    /// Custom image-token budget with optional post-vision feature pruning.
+    case custom(maxImageTokens: Int, pruneTokens: Int?)
+
+    public static let `default`: VLMImagePolicy = .balanced
+}
+
+extension VLMImagePolicy: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .quality:
+            return "quality"
+        case .balanced:
+            return "balanced"
+        case .fast:
+            return "fast"
+        case .custom(let maxImageTokens, let pruneTokens):
+            return "custom(maxImageTokens:\(maxImageTokens),pruneTokens:\(pruneTokens.map(String.init) ?? "nil"))"
+        }
+    }
+}
+
 public final class VLMEngine: ObservableObject {
     private static let eosSamplingLogitPenalty: Float = 20
 
@@ -19,6 +47,7 @@ public final class VLMEngine: ObservableObject {
     public private(set) var currentPlan: MemoryBudgetPlanner.Plan?
     public private(set) var archInfo: ModelArchInfo?
     public private(set) var visionOffloaded: Bool = false
+    public private(set) var defaultImagePolicy: VLMImagePolicy = .default
     public let promptCache = PromptCacheManager()
 
     private var modelDirectory: URL?
@@ -69,6 +98,24 @@ public final class VLMEngine: ObservableObject {
         let shape: [Int]
         let imageTokenCounts: [Int]
         let source: String
+    }
+
+    struct NativeVLMImagePolicySettings: Equatable, Sendable {
+        let policy: VLMImagePolicy
+        let maxImageTokens: Int?
+        let pruneTokens: Int?
+        let maxImageTokensOverriddenByEnvironment: Bool
+        let pruneTokensOverriddenByEnvironment: Bool
+
+        var diagnosticSummary: String {
+            [
+                "policy=\(policy)",
+                "maxImageTokens=\(maxImageTokens.map(String.init) ?? "nil")",
+                "pruneTokens=\(pruneTokens.map(String.init) ?? "nil")",
+                "envMax=\(maxImageTokensOverriddenByEnvironment)",
+                "envPrune=\(pruneTokensOverriddenByEnvironment)",
+            ].joined(separator: " ")
+        }
     }
 
     struct NativeVLMTextDeltaPrefillPlan: Equatable {
@@ -310,21 +357,34 @@ public final class VLMEngine: ObservableObject {
         }
     }
 
-    public init() {}
+    public init(imagePolicy: VLMImagePolicy = .default) {
+        defaultImagePolicy = imagePolicy
+    }
 
-    public func loadLocal(directory: URL, onProgress: ((Double) -> Void)? = nil) async throws {
-        try await loadLocal(directory: directory, options: nil, onProgress: onProgress)
+    public func loadLocal(
+        directory: URL,
+        imagePolicy: VLMImagePolicy = .default,
+        onProgress: ((Double) -> Void)? = nil
+    ) async throws {
+        try await loadLocal(
+            directory: directory,
+            options: nil,
+            imagePolicy: imagePolicy,
+            onProgress: onProgress
+        )
     }
 
     public func loadLocal(
         directory: URL,
         options: NativeRuntimeLoadOptions?,
+        imagePolicy: VLMImagePolicy = .default,
         onProgress: ((Double) -> Void)? = nil
     ) async throws {
         guard state != .loading else { return }
         state = .loading
         downloadProgress = 0
         onProgress?(0)
+        defaultImagePolicy = imagePolicy
         do {
             let index = try QwenVLMModelBundleIndex.load(from: directory)
             modelDirectory = directory
@@ -419,14 +479,16 @@ public final class VLMEngine: ObservableObject {
         images: [URL] = [],
         tools: [ToolSpec]? = nil,
         onToolCall: (@Sendable (ToolCall) async throws -> String)? = nil,
-        parameters: EdgeGenerateParameters = .default
+        parameters: EdgeGenerateParameters = .default,
+        imagePolicy: VLMImagePolicy? = nil
     ) -> AsyncThrowingStream<GenerateChunk, Error> {
         if !images.isEmpty {
             return generateNativeImage(
                 messages: messages,
                 inputs: images.map(NativeVLMImageInput.url),
                 tools: tools,
-                parameters: parameters
+                parameters: parameters,
+                imagePolicy: imagePolicy ?? defaultImagePolicy
             )
         }
         return generateNativeText(
@@ -441,14 +503,16 @@ public final class VLMEngine: ObservableObject {
         ciImages: [CIImage],
         tools: [ToolSpec]? = nil,
         onToolCall: (@Sendable (ToolCall) async throws -> String)? = nil,
-        parameters: EdgeGenerateParameters = .default
+        parameters: EdgeGenerateParameters = .default,
+        imagePolicy: VLMImagePolicy? = nil
     ) -> AsyncThrowingStream<GenerateChunk, Error> {
         if !ciImages.isEmpty {
             return generateNativeImage(
                 messages: messages,
                 inputs: ciImages.map(NativeVLMImageInput.ciImage),
                 tools: tools,
-                parameters: parameters
+                parameters: parameters,
+                imagePolicy: imagePolicy ?? defaultImagePolicy
             )
         }
         return generateNativeText(
@@ -461,13 +525,22 @@ public final class VLMEngine: ObservableObject {
     public func generateStream(
         messages: [ChatMessage],
         images: [URL] = [],
-        parameters: EdgeGenerateParameters = .default
+        parameters: EdgeGenerateParameters = .default,
+        imagePolicy: VLMImagePolicy? = nil
     ) -> AsyncThrowingStream<GenerateChunk, Error> {
-        generate(messages: messages, images: images, parameters: parameters)
+        generate(
+            messages: messages,
+            images: images,
+            parameters: parameters,
+            imagePolicy: imagePolicy
+        )
     }
 
     @discardableResult
-    public func preloadImageFeatures(image: URL) async throws -> Int {
+    public func preloadImageFeatures(
+        image: URL,
+        imagePolicy: VLMImagePolicy? = nil
+    ) async throws -> Int {
         guard state == .ready else {
             throw EdgeRuntimeError.loadFailed("VLM image preload requires a ready model")
         }
@@ -476,14 +549,20 @@ public final class VLMEngine: ObservableObject {
         }
 
         let inputs: [NativeVLMImageInput] = [.url(image)]
+        let resolvedImagePolicy = imagePolicy ?? defaultImagePolicy
+        let imagePolicySettings = Self.nativeVLMImagePolicySettings(
+            for: resolvedImagePolicy
+        )
         let imageProcessorConfig = nativeVLMImageProcessorConfiguration(
             container: container,
+            settings: imagePolicySettings,
             emitDiagnostics: false
         )
         guard let cacheKey = nativeVLMPreparedImageCacheKey(
             inputs: inputs,
             container: container,
-            imageProcessorConfig: imageProcessorConfig
+            imageProcessorConfig: imageProcessorConfig,
+            settings: imagePolicySettings
         ) else {
             throw EdgeRuntimeError.loadFailed("VLM image preload requires file-backed image input")
         }
@@ -511,7 +590,8 @@ public final class VLMEngine: ObservableObject {
             try await self.prepareNativeVLMImageFeaturesForPreload(
                 inputs: inputs,
                 cacheKey: cacheKey,
-                imageProcessorConfig: imageProcessorConfig
+                imageProcessorConfig: imageProcessorConfig,
+                settings: imagePolicySettings
             )
         }
         nativeVLMPreparedImagePreloadTasks[cacheKey] = task
@@ -663,12 +743,71 @@ public final class VLMEngine: ObservableObject {
         return Int(raw)
     }
 
+    private nonisolated static func environmentInt(
+        _ name: String,
+        in environment: [String: String]
+    ) -> Int? {
+        guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else {
+            return nil
+        }
+        return Int(raw)
+    }
+
+    nonisolated static func nativeVLMImagePolicySettings(
+        for policy: VLMImagePolicy,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> NativeVLMImagePolicySettings {
+        let defaultMaxImageTokens: Int? = {
+            switch policy {
+            case .quality:
+                return 768
+            case .balanced:
+                return 256
+            case .fast:
+                return 130
+            case .custom(let maxImageTokens, _):
+                return max(maxImageTokens, 1)
+            }
+        }()
+        let defaultPruneTokens: Int? = {
+            switch policy {
+            case .quality, .balanced:
+                return nil
+            case .fast:
+                return 64
+            case .custom(_, let pruneTokens):
+                guard let pruneTokens, pruneTokens > 0 else { return nil }
+                return pruneTokens
+            }
+        }()
+        let envBudget = environmentInt(
+            "EDGE_VLM_IMAGE_TOKEN_BUDGET",
+            in: environment
+        )
+        let envPrune = environmentInt(
+            "EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS",
+            in: environment
+        )
+        let maxImageTokens = envBudget.map { $0 > 0 ? $0 : nil } ?? defaultMaxImageTokens
+        let pruneTokens = envPrune.map { $0 > 0 ? $0 : nil } ?? defaultPruneTokens
+        return NativeVLMImagePolicySettings(
+            policy: policy,
+            maxImageTokens: maxImageTokens,
+            pruneTokens: pruneTokens,
+            maxImageTokensOverriddenByEnvironment: envBudget != nil,
+            pruneTokensOverriddenByEnvironment: envPrune != nil
+        )
+    }
+
     private func nativeVLMImageProcessorConfiguration(
         container: QwenVLMNativeContainer,
+        settings: NativeVLMImagePolicySettings,
         emitDiagnostics: Bool
     ) -> QwenImageProcessorConfiguration {
         var imageProcessorConfig = container.index.preflightResult.plan.imageProcessorConfiguration
-        if let imageTokenBudget = Self.environmentInt("EDGE_VLM_IMAGE_TOKEN_BUDGET"),
+        if let imageTokenBudget = settings.maxImageTokens,
            imageTokenBudget > 0 {
             let plan = container.index.preflightResult.plan
             let patchSize = imageProcessorConfig.patchSize
@@ -684,9 +823,11 @@ public final class VLMEngine: ObservableObject {
             }
             if emitDiagnostics {
                 emitVLMDiagnostic(
-                    "vlm_image_token_budget_override budget=\(imageTokenBudget) patch=\(patchSize) merge=\(mergeSize) maxPixels=\(maxPixels) appliedMax=\(imageProcessorConfig.maxPixels ?? currentMax)"
+                    "vlm_image_token_budget_apply \(settings.diagnosticSummary) budget=\(imageTokenBudget) patch=\(patchSize) merge=\(mergeSize) maxPixels=\(maxPixels) appliedMax=\(imageProcessorConfig.maxPixels ?? currentMax)"
                 )
             }
+        } else if emitDiagnostics {
+            emitVLMDiagnostic("vlm_image_policy \(settings.diagnosticSummary)")
         }
         let deviceRAMGB = DeviceProfile.current.totalRAMGB
         if deviceRAMGB < 12 {
@@ -705,7 +846,8 @@ public final class VLMEngine: ObservableObject {
     private func nativeVLMPreparedImageCacheKey(
         inputs: [NativeVLMImageInput],
         container: QwenVLMNativeContainer,
-        imageProcessorConfig: QwenImageProcessorConfiguration
+        imageProcessorConfig: QwenImageProcessorConfiguration,
+        settings: NativeVLMImagePolicySettings
     ) -> NativeVLMPreparedImageKey? {
         guard !inputs.isEmpty else {
             return nil
@@ -738,7 +880,7 @@ public final class VLMEngine: ObservableObject {
         let mergeSize = plan.visionConfiguration.spatialMergeSize
             ?? imageProcessorConfig.mergeSize
             ?? 2
-        let pruneTokens = Self.environmentInt("EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS") ?? -1
+        let pruneTokens = settings.pruneTokens ?? -1
         let modelKey = modelDirectory?.standardizedFileURL.path ?? "unknown"
         let rawValue = [
             "model=\(modelKey)",
@@ -823,6 +965,7 @@ public final class VLMEngine: ObservableObject {
         inputs: [NativeVLMImageInput],
         container: QwenVLMNativeContainer,
         imageProcessorConfig: QwenImageProcessorConfiguration,
+        settings: NativeVLMImagePolicySettings,
         cacheKey: NativeVLMPreparedImageKey?,
         memoryBefore: Int
     ) throws -> NativeVLMPreprocessedImages {
@@ -875,7 +1018,7 @@ public final class VLMEngine: ObservableObject {
         )
         let imageFeaturePrunePlan = NativeVLMImageFeaturePruner.makePlan(
             imageTokenCounts: originalImageTokenCounts,
-            maxTokensPerImage: Self.environmentInt("EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS")
+            maxTokensPerImage: settings.pruneTokens
         )
         let imageTokenCounts = imageFeaturePrunePlan?.effectiveImageTokenCounts ?? originalImageTokenCounts
         let pixelValuesMB = Float(pixelValues.count * 4) / 1_048_576.0
@@ -978,7 +1121,8 @@ public final class VLMEngine: ObservableObject {
     private func prepareNativeVLMImageFeaturesForPreload(
         inputs: [NativeVLMImageInput],
         cacheKey: NativeVLMPreparedImageKey,
-        imageProcessorConfig: QwenImageProcessorConfiguration
+        imageProcessorConfig: QwenImageProcessorConfiguration,
+        settings: NativeVLMImagePolicySettings
     ) async throws -> NativeVLMPreparedImageFeatures {
         guard let container = nativeContainer else {
             throw EdgeRuntimeError.loadFailed("Native VLM runtime is not initialized")
@@ -990,6 +1134,7 @@ public final class VLMEngine: ObservableObject {
             inputs: inputs,
             container: container,
             imageProcessorConfig: imageProcessorConfig,
+            settings: settings,
             cacheKey: cacheKey,
             memoryBefore: memoryBefore
         )
@@ -1922,7 +2067,8 @@ public final class VLMEngine: ObservableObject {
         messages: [ChatMessage],
         inputs: [NativeVLMImageInput],
         tools: [ToolSpec]?,
-        parameters: EdgeGenerateParameters
+        parameters: EdgeGenerateParameters,
+        imagePolicy: VLMImagePolicy
     ) -> AsyncThrowingStream<GenerateChunk, Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
@@ -1931,6 +2077,7 @@ public final class VLMEngine: ObservableObject {
                         messages: messages,
                         inputs: inputs,
                         tools: tools,
+                        imagePolicy: imagePolicy,
                         requestedParameters: parameters,
                         continuation: continuation
                     )
@@ -1949,6 +2096,7 @@ public final class VLMEngine: ObservableObject {
         messages: [ChatMessage],
         inputs: [NativeVLMImageInput],
         tools: [ToolSpec]?,
+        imagePolicy: VLMImagePolicy,
         requestedParameters: EdgeGenerateParameters,
         continuation: AsyncThrowingStream<GenerateChunk, Error>.Continuation
     ) async throws {
@@ -1976,14 +2124,20 @@ public final class VLMEngine: ObservableObject {
         NSLog("[VLM-MEM] image generate start: %.0f MB", memoryBefore)
         emitVLMDiagnostic("vlm_mem image_generate_start mb=\(memoryBefore)")
 
+        let imagePolicySettings = Self.nativeVLMImagePolicySettings(
+            for: imagePolicy
+        )
+        emitVLMDiagnostic("vlm_image_policy \(imagePolicySettings.diagnosticSummary)")
         let imageProcessorConfig = nativeVLMImageProcessorConfiguration(
             container: container,
+            settings: imagePolicySettings,
             emitDiagnostics: true
         )
         let preparedImageCacheKey = nativeVLMPreparedImageCacheKey(
             inputs: inputs,
             container: container,
-            imageProcessorConfig: imageProcessorConfig
+            imageProcessorConfig: imageProcessorConfig,
+            settings: imagePolicySettings
         )
         var preparedImageFeatures = try await cachedOrPreloadedNativeVLMImageFeatures(
             cacheKey: preparedImageCacheKey
@@ -1999,6 +2153,7 @@ public final class VLMEngine: ObservableObject {
                 inputs: inputs,
                 container: container,
                 imageProcessorConfig: imageProcessorConfig,
+                settings: imagePolicySettings,
                 cacheKey: preparedImageCacheKey,
                 memoryBefore: memoryBefore
             )
