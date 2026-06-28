@@ -2171,6 +2171,9 @@ public final class VLMEngine: ObservableObject {
                     )
                     if preparedImageFeatures != nil {
                         emitVLMDiagnostic(
+                            "vlm_prepared_hit_append_fallback reason=\(reason)"
+                        )
+                        emitVLMDiagnostic(
                             "vlm_cmlx_session_preserve reason=prepared_image_features_append_plan_failed"
                         )
                     } else {
