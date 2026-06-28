@@ -36,11 +36,39 @@ public final class VLMEngine: ObservableObject {
     private var nativeVLMCmlxFrogJumpLayerMask: UInt64 = 0
     private var nativeVLMCmlxAttentionCacheLimit: Int?
     private var nativeCmlxLimitState = NativeCmlxCommandBufferLimitState()
+    private var nativeVLMPreparedImageCache: [NativeVLMPreparedImageKey: NativeVLMPreparedImageFeatures] = [:]
+    private var nativeVLMPreparedImageCacheOrder: [NativeVLMPreparedImageKey] = []
+    private var nativeVLMPreparedImagePreloadTasks: [NativeVLMPreparedImageKey: Task<NativeVLMPreparedImageFeatures, Error>] = [:]
     public var diagnosticSink: ((String) -> Void)?
 
     private enum NativeVLMImageInput {
         case url(URL)
         case ciImage(CIImage)
+    }
+
+    private struct NativeVLMPreparedImageKey: Hashable, CustomStringConvertible {
+        let rawValue: String
+
+        var description: String { rawValue }
+    }
+
+    private struct NativeVLMPreprocessedImages {
+        let cacheKey: NativeVLMPreparedImageKey?
+        let pixelValues: [Float]
+        let patchDim: Int
+        let totalPatchCount: Int
+        let grids: [QwenImageGridTHW]
+        let originalImageTokenCounts: [Int]
+        let imageTokenCounts: [Int]
+        let imageFeaturePrunePlan: NativeVLMImageFeaturePrunePlan?
+    }
+
+    private struct NativeVLMPreparedImageFeatures {
+        let cacheKey: NativeVLMPreparedImageKey?
+        let values: [Float]
+        let shape: [Int]
+        let imageTokenCounts: [Int]
+        let source: String
     }
 
     struct NativeVLMTextDeltaPrefillPlan: Equatable {
@@ -369,6 +397,7 @@ public final class VLMEngine: ObservableObject {
                 tokenizer: tokenizer,
                 modelDirectory: directory
             )
+            clearNativeVLMPreparedImageCache()
             downloadProgress = 1
             onProgress?(1)
             state = .ready
@@ -435,6 +464,72 @@ public final class VLMEngine: ObservableObject {
         parameters: EdgeGenerateParameters = .default
     ) -> AsyncThrowingStream<GenerateChunk, Error> {
         generate(messages: messages, images: images, parameters: parameters)
+    }
+
+    @discardableResult
+    public func preloadImageFeatures(image: URL) async throws -> Int {
+        guard state == .ready else {
+            throw EdgeRuntimeError.loadFailed("VLM image preload requires a ready model")
+        }
+        guard let container = nativeContainer else {
+            throw EdgeRuntimeError.loadFailed("Native VLM runtime is not initialized")
+        }
+
+        let inputs: [NativeVLMImageInput] = [.url(image)]
+        let imageProcessorConfig = nativeVLMImageProcessorConfiguration(
+            container: container,
+            emitDiagnostics: false
+        )
+        guard let cacheKey = nativeVLMPreparedImageCacheKey(
+            inputs: inputs,
+            container: container,
+            imageProcessorConfig: imageProcessorConfig
+        ) else {
+            throw EdgeRuntimeError.loadFailed("VLM image preload requires file-backed image input")
+        }
+
+        if let cached = nativeVLMPreparedImageCache[cacheKey] {
+            emitVLMDiagnostic(
+                "vlm_image_feature_preload_cache_hit key=\(cacheKey.rawValue.hashValue) imageTokens=\(cached.imageTokenCounts)"
+            )
+            return cached.imageTokenCounts.reduce(0, +)
+        }
+        if let task = nativeVLMPreparedImagePreloadTasks[cacheKey] {
+            emitVLMDiagnostic(
+                "vlm_image_feature_preload_join key=\(cacheKey.rawValue.hashValue)"
+            )
+            let prepared = try await task.value
+            nativeVLMPreparedImagePreloadTasks[cacheKey] = nil
+            storeNativeVLMPreparedImageFeatures(prepared)
+            return prepared.imageTokenCounts.reduce(0, +)
+        }
+
+        emitVLMDiagnostic(
+            "vlm_image_feature_preload_begin key=\(cacheKey.rawValue.hashValue)"
+        )
+        let task = Task.detached(priority: .userInitiated) { [self] in
+            try await self.prepareNativeVLMImageFeaturesForPreload(
+                inputs: inputs,
+                cacheKey: cacheKey,
+                imageProcessorConfig: imageProcessorConfig
+            )
+        }
+        nativeVLMPreparedImagePreloadTasks[cacheKey] = task
+        do {
+            let prepared = try await task.value
+            nativeVLMPreparedImagePreloadTasks[cacheKey] = nil
+            storeNativeVLMPreparedImageFeatures(prepared)
+            emitVLMDiagnostic(
+                "vlm_image_feature_preload_done key=\(cacheKey.rawValue.hashValue) imageTokens=\(prepared.imageTokenCounts) shape=\(prepared.shape)"
+            )
+            return prepared.imageTokenCounts.reduce(0, +)
+        } catch {
+            nativeVLMPreparedImagePreloadTasks[cacheKey] = nil
+            emitVLMDiagnostic(
+                "vlm_image_feature_preload_failed key=\(cacheKey.rawValue.hashValue) error=\(error)"
+            )
+            throw error
+        }
     }
 
     public func tokenize(_ text: String) async throws -> [Int] {
@@ -522,6 +617,7 @@ public final class VLMEngine: ObservableObject {
         nativeContainer = nil
         nativeTokenizer = nil
         nativeEndTokenIds = []
+        clearNativeVLMPreparedImageCache()
         resetNativeVLMCmlxLedger()
         turnCounter = 0
         archInfo = nil
@@ -565,6 +661,368 @@ public final class VLMEngine: ObservableObject {
             return nil
         }
         return Int(raw)
+    }
+
+    private func nativeVLMImageProcessorConfiguration(
+        container: QwenVLMNativeContainer,
+        emitDiagnostics: Bool
+    ) -> QwenImageProcessorConfiguration {
+        var imageProcessorConfig = container.index.preflightResult.plan.imageProcessorConfiguration
+        if let imageTokenBudget = Self.environmentInt("EDGE_VLM_IMAGE_TOKEN_BUDGET"),
+           imageTokenBudget > 0 {
+            let plan = container.index.preflightResult.plan
+            let patchSize = imageProcessorConfig.patchSize
+                ?? plan.visionConfiguration.patchSize
+                ?? 16
+            let mergeSize = plan.visionConfiguration.spatialMergeSize
+                ?? imageProcessorConfig.mergeSize
+                ?? 2
+            let maxPixels = imageTokenBudget * patchSize * patchSize * mergeSize * mergeSize
+            let currentMax = imageProcessorConfig.maxPixels ?? (16_384 * 28 * 28)
+            if maxPixels < currentMax {
+                imageProcessorConfig.maxPixels = maxPixels
+            }
+            if emitDiagnostics {
+                emitVLMDiagnostic(
+                    "vlm_image_token_budget_override budget=\(imageTokenBudget) patch=\(patchSize) merge=\(mergeSize) maxPixels=\(maxPixels) appliedMax=\(imageProcessorConfig.maxPixels ?? currentMax)"
+                )
+            }
+        }
+        let deviceRAMGB = DeviceProfile.current.totalRAMGB
+        if deviceRAMGB < 12 {
+            let safeCap = 1280 * 28 * 28
+            let currentMax = imageProcessorConfig.maxPixels ?? (16_384 * 28 * 28)
+            if currentMax > safeCap {
+                imageProcessorConfig.maxPixels = safeCap
+                if emitDiagnostics {
+                    NSLog("[VLM-MEM] clamped maxPixels %d → %d (device %d GB RAM)", currentMax, safeCap, deviceRAMGB)
+                }
+            }
+        }
+        return imageProcessorConfig
+    }
+
+    private func nativeVLMPreparedImageCacheKey(
+        inputs: [NativeVLMImageInput],
+        container: QwenVLMNativeContainer,
+        imageProcessorConfig: QwenImageProcessorConfiguration
+    ) -> NativeVLMPreparedImageKey? {
+        guard !inputs.isEmpty else {
+            return nil
+        }
+        var descriptors: [String] = []
+        descriptors.reserveCapacity(inputs.count)
+        for input in inputs {
+            switch input {
+            case .url(let url):
+                let standardizedURL = url.standardizedFileURL
+                let attributes = try? FileManager.default.attributesOfItem(
+                    atPath: standardizedURL.path
+                )
+                let size = (attributes?[.size] as? NSNumber)?.int64Value ?? -1
+                let modifiedAt = (attributes?[.modificationDate] as? Date)?
+                    .timeIntervalSince1970 ?? -1
+                let modifiedMs = Int64((modifiedAt * 1000).rounded())
+                descriptors.append(
+                    "url=\(standardizedURL.path)|size=\(size)|modifiedMs=\(modifiedMs)"
+                )
+            case .ciImage:
+                return nil
+            }
+        }
+
+        let plan = container.index.preflightResult.plan
+        let patchSize = imageProcessorConfig.patchSize
+            ?? plan.visionConfiguration.patchSize
+            ?? 16
+        let mergeSize = plan.visionConfiguration.spatialMergeSize
+            ?? imageProcessorConfig.mergeSize
+            ?? 2
+        let pruneTokens = Self.environmentInt("EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS") ?? -1
+        let modelKey = modelDirectory?.standardizedFileURL.path ?? "unknown"
+        let rawValue = [
+            "model=\(modelKey)",
+            "maxPixels=\(imageProcessorConfig.maxPixels ?? -1)",
+            "minPixels=\(imageProcessorConfig.minPixels ?? -1)",
+            "patch=\(patchSize)",
+            "merge=\(mergeSize)",
+            "prune=\(pruneTokens)",
+            "inputs=\(descriptors.joined(separator: ","))"
+        ].joined(separator: ";")
+        return NativeVLMPreparedImageKey(rawValue: rawValue)
+    }
+
+    private func storeNativeVLMPreparedImageFeatures(
+        _ prepared: NativeVLMPreparedImageFeatures
+    ) {
+        guard let cacheKey = prepared.cacheKey else {
+            return
+        }
+        nativeVLMPreparedImageCache[cacheKey] = prepared
+        nativeVLMPreparedImageCacheOrder.removeAll { $0 == cacheKey }
+        nativeVLMPreparedImageCacheOrder.append(cacheKey)
+        while nativeVLMPreparedImageCacheOrder.count > 4 {
+            let evicted = nativeVLMPreparedImageCacheOrder.removeFirst()
+            nativeVLMPreparedImageCache.removeValue(forKey: evicted)
+            emitVLMDiagnostic(
+                "vlm_image_feature_cache_evict key=\(evicted.rawValue.hashValue)"
+            )
+        }
+    }
+
+    private func clearNativeVLMPreparedImageCache() {
+        for task in nativeVLMPreparedImagePreloadTasks.values {
+            task.cancel()
+        }
+        nativeVLMPreparedImagePreloadTasks.removeAll()
+        nativeVLMPreparedImageCache.removeAll()
+        nativeVLMPreparedImageCacheOrder.removeAll()
+    }
+
+    private func cachedOrPreloadedNativeVLMImageFeatures(
+        cacheKey: NativeVLMPreparedImageKey?
+    ) async throws -> NativeVLMPreparedImageFeatures? {
+        guard let cacheKey else {
+            return nil
+        }
+        if let cached = nativeVLMPreparedImageCache[cacheKey] {
+            nativeVLMPreparedImageCacheOrder.removeAll { $0 == cacheKey }
+            nativeVLMPreparedImageCacheOrder.append(cacheKey)
+            emitVLMDiagnostic(
+                "vlm_image_feature_cache_hit key=\(cacheKey.rawValue.hashValue) imageTokens=\(cached.imageTokenCounts) shape=\(cached.shape)"
+            )
+            return cached
+        }
+        guard let task = nativeVLMPreparedImagePreloadTasks[cacheKey] else {
+            emitVLMDiagnostic(
+                "vlm_image_feature_cache_miss key=\(cacheKey.rawValue.hashValue)"
+            )
+            return nil
+        }
+        emitVLMDiagnostic(
+            "vlm_image_feature_preload_await key=\(cacheKey.rawValue.hashValue)"
+        )
+        do {
+            let prepared = try await task.value
+            nativeVLMPreparedImagePreloadTasks[cacheKey] = nil
+            storeNativeVLMPreparedImageFeatures(prepared)
+            emitVLMDiagnostic(
+                "vlm_image_feature_preload_consume key=\(cacheKey.rawValue.hashValue) imageTokens=\(prepared.imageTokenCounts) shape=\(prepared.shape)"
+            )
+            return prepared
+        } catch {
+            nativeVLMPreparedImagePreloadTasks[cacheKey] = nil
+            emitVLMDiagnostic(
+                "vlm_image_feature_preload_consume_failed key=\(cacheKey.rawValue.hashValue) error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    private func preprocessNativeVLMImages(
+        inputs: [NativeVLMImageInput],
+        container: QwenVLMNativeContainer,
+        imageProcessorConfig: QwenImageProcessorConfiguration,
+        cacheKey: NativeVLMPreparedImageKey?,
+        memoryBefore: Int
+    ) throws -> NativeVLMPreprocessedImages {
+        let preprocessings = try inputs.map { input in
+            switch input {
+            case .url(let url):
+                return try QwenImagePreprocessor.preprocessImage(
+                    at: url,
+                    configuration: imageProcessorConfig
+                )
+            case .ciImage(let image):
+                return try QwenImagePreprocessor.preprocessCIImage(
+                    image,
+                    configuration: imageProcessorConfig
+                )
+            }
+        }
+        let afterPreprocess = DeviceProfile.captureMemorySnapshot().footprintMB
+        NSLog("[VLM-MEM] after image preprocess: %.0f MB (+%.0f)", afterPreprocess, afterPreprocess - memoryBefore)
+        emitVLMDiagnostic(
+            "vlm_mem after_image_preprocess mb=\(afterPreprocess) delta=\(afterPreprocess - memoryBefore)"
+        )
+
+        let resolvedPatchSize = imageProcessorConfig.patchSize
+            ?? container.index.preflightResult.plan.visionConfiguration.patchSize
+            ?? 16
+        let targetSizes = preprocessings.map { item in
+            "\(item.imageGridTHW.height * resolvedPatchSize)x\(item.imageGridTHW.width * resolvedPatchSize)"
+        }
+        emitVLMDiagnostic(
+            "vlm_mem image_target_sizes sizes=\(targetSizes) patch=\(resolvedPatchSize)"
+        )
+
+        let patchDim = try Self.patchDimension(preprocessings)
+        let totalPatchCount = preprocessings.reduce(0) { partial, item in
+            partial + item.pixelValuesShape[0]
+        }
+        NSLog("[VLM-MEM] patches=%d patchDim=%d grids=%@", totalPatchCount, patchDim, preprocessings.map(\.imageGridTHW).description)
+        emitVLMDiagnostic(
+            "vlm_mem image_patches patches=\(totalPatchCount) patchDim=\(patchDim) grids=\(preprocessings.map(\.imageGridTHW).description)"
+        )
+        let pixelValues = preprocessings.reduce(into: [Float]()) { result, item in
+            result.reserveCapacity(result.count + item.pixelValues.count)
+            result.append(contentsOf: item.pixelValues)
+        }
+        let grids = preprocessings.map(\.imageGridTHW)
+        let originalImageTokenCounts = try Self.imageTokenCounts(
+            for: grids,
+            plan: container.index.preflightResult.plan
+        )
+        let imageFeaturePrunePlan = NativeVLMImageFeaturePruner.makePlan(
+            imageTokenCounts: originalImageTokenCounts,
+            maxTokensPerImage: Self.environmentInt("EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS")
+        )
+        let imageTokenCounts = imageFeaturePrunePlan?.effectiveImageTokenCounts ?? originalImageTokenCounts
+        let pixelValuesMB = Float(pixelValues.count * 4) / 1_048_576.0
+        NSLog("[VLM-MEM] imageTokenCounts=%@, originalImageTokenCounts=%@, pixelValues=%.1f MB", imageTokenCounts.description, originalImageTokenCounts.description, pixelValuesMB)
+        emitVLMDiagnostic(
+            "vlm_mem image_tokens counts=\(imageTokenCounts) originalCounts=\(originalImageTokenCounts) pixelValuesMB=\(String(format: "%.1f", pixelValuesMB))"
+        )
+        if let imageFeaturePrunePlan, imageFeaturePrunePlan.isPruned {
+            emitVLMDiagnostic(
+                "vlm_image_feature_prune_plan strategy=uniform_row_major original=\(imageFeaturePrunePlan.originalImageTokenCounts) effective=\(imageFeaturePrunePlan.effectiveImageTokenCounts) selected=\(imageFeaturePrunePlan.selectedRowIndices.count)"
+            )
+        }
+        return NativeVLMPreprocessedImages(
+            cacheKey: cacheKey,
+            pixelValues: pixelValues,
+            patchDim: patchDim,
+            totalPatchCount: totalPatchCount,
+            grids: grids,
+            originalImageTokenCounts: originalImageTokenCounts,
+            imageTokenCounts: imageTokenCounts,
+            imageFeaturePrunePlan: imageFeaturePrunePlan
+        )
+    }
+
+    private func encodeNativeVLMImageFeatures(
+        preprocessed: NativeVLMPreprocessedImages,
+        container: QwenVLMNativeContainer,
+        memoryBefore: Int,
+        source: String
+    ) throws -> NativeVLMPreparedImageFeatures {
+        if container.isCmlxVisionLoaded {
+            container.unloadCmlxVisionWeights()
+        }
+        let beforeVision = DeviceProfile.captureMemorySnapshot().footprintMB
+        NSLog("[VLM-MEM] before vision encoder load: %.0f MB", beforeVision)
+        emitVLMDiagnostic(
+            "vlm_mem before_vision_encoder_load mb=\(beforeVision) deltaFromStart=\(beforeVision - memoryBefore)"
+        )
+        try container.loadCmlxVisionWeights(
+            diagnosticSink: { [weak self] marker in
+                self?.emitVLMDiagnostic(marker)
+            }
+        )
+        let afterVisionLoad = DeviceProfile.captureMemorySnapshot().footprintMB
+        NSLog("[VLM-MEM] after vision encoder load: %.0f MB (+%.0f)", afterVisionLoad, afterVisionLoad - beforeVision)
+        emitVLMDiagnostic(
+            "vlm_mem after_vision_encoder_load mb=\(afterVisionLoad) delta=\(afterVisionLoad - beforeVision)"
+        )
+
+        let visionEncoding: EdgeMLXQwen35VisionEncoding
+        do {
+            defer {
+                container.unloadCmlxVisionWeights()
+                let afterUnload = DeviceProfile.captureMemorySnapshot().footprintMB
+                NSLog("[VLM-MEM] after vision encoder unload: %.0f MB", afterUnload)
+                emitVLMDiagnostic(
+                    "vlm_mem after_vision_encoder_unload mb=\(afterUnload) deltaFromStart=\(afterUnload - memoryBefore)"
+                )
+            }
+            visionEncoding = try container.visionEncode(
+                pixelValues: preprocessed.pixelValues,
+                pixelValuesShape: [preprocessed.totalPatchCount, preprocessed.patchDim],
+                gridTHW: preprocessed.grids
+            )
+            let afterVisionEncode = DeviceProfile.captureMemorySnapshot().footprintMB
+            NSLog("[VLM-MEM] after vision encode: %.0f MB (+%.0f from load)", afterVisionEncode, afterVisionEncode - afterVisionLoad)
+            emitVLMDiagnostic(
+                "vlm_mem after_vision_encode mb=\(afterVisionEncode) deltaFromVisionLoad=\(afterVisionEncode - afterVisionLoad)"
+            )
+        }
+
+        let originalTotalImageTokenCount = preprocessed.originalImageTokenCounts.reduce(0, +)
+        guard visionEncoding.shape.first == originalTotalImageTokenCount else {
+            throw EdgeRuntimeError.loadFailed("Native VLM vision encoder returned no image tokens")
+        }
+        let effectiveVisionEncoding = try NativeVLMImageFeaturePruner.apply(
+            plan: preprocessed.imageFeaturePrunePlan,
+            values: visionEncoding.values,
+            shape: visionEncoding.shape
+        )
+        let totalImageTokenCount = preprocessed.imageTokenCounts.reduce(0, +)
+        guard effectiveVisionEncoding.shape.first == totalImageTokenCount else {
+            throw EdgeRuntimeError.loadFailed("Native VLM pruned image token count mismatch")
+        }
+        if let imageFeaturePrunePlan = preprocessed.imageFeaturePrunePlan,
+           imageFeaturePrunePlan.isPruned {
+            emitVLMDiagnostic(
+                "vlm_image_feature_prune_applied originalShape=\(visionEncoding.shape) effectiveShape=\(effectiveVisionEncoding.shape)"
+            )
+        }
+        return NativeVLMPreparedImageFeatures(
+            cacheKey: preprocessed.cacheKey,
+            values: effectiveVisionEncoding.values,
+            shape: effectiveVisionEncoding.shape,
+            imageTokenCounts: preprocessed.imageTokenCounts,
+            source: source
+        )
+    }
+
+    private func prepareNativeVLMImageFeaturesForPreload(
+        inputs: [NativeVLMImageInput],
+        cacheKey: NativeVLMPreparedImageKey,
+        imageProcessorConfig: QwenImageProcessorConfiguration
+    ) async throws -> NativeVLMPreparedImageFeatures {
+        guard let container = nativeContainer else {
+            throw EdgeRuntimeError.loadFailed("Native VLM runtime is not initialized")
+        }
+        try Task.checkCancellation()
+        let memoryBefore = DeviceProfile.captureMemorySnapshot().footprintMB
+        emitVLMDiagnostic("vlm_mem image_preload_start mb=\(memoryBefore)")
+        let preprocessed = try preprocessNativeVLMImages(
+            inputs: inputs,
+            container: container,
+            imageProcessorConfig: imageProcessorConfig,
+            cacheKey: cacheKey,
+            memoryBefore: memoryBefore
+        )
+
+        var didUnloadDecoderWeightsPreservingState = false
+        if container.isCmlxDecoderLoaded {
+            emitVLMDiagnostic("vlm_image_feature_preload_decoder_unload_begin")
+            try container.unloadCmlxDecoderWeightsPreservingState()
+            didUnloadDecoderWeightsPreservingState = true
+            emitVLMDiagnostic("vlm_image_feature_preload_decoder_unload_done")
+        }
+
+        do {
+            let prepared = try encodeNativeVLMImageFeatures(
+                preprocessed: preprocessed,
+                container: container,
+                memoryBefore: memoryBefore,
+                source: "preload"
+            )
+            if didUnloadDecoderWeightsPreservingState {
+                emitVLMDiagnostic("vlm_image_feature_preload_decoder_reload_begin")
+                try container.reloadCmlxDecoderWeightsPreservingState()
+                emitVLMDiagnostic("vlm_image_feature_preload_decoder_reload_done")
+            }
+            return prepared
+        } catch {
+            if didUnloadDecoderWeightsPreservingState {
+                emitVLMDiagnostic("vlm_image_feature_preload_decoder_reload_after_error_begin")
+                try? container.reloadCmlxDecoderWeightsPreservingState()
+                emitVLMDiagnostic("vlm_image_feature_preload_decoder_reload_after_error_done")
+            }
+            throw error
+        }
     }
 
     private func resetNativeVLMCmlxLedger() {
@@ -1518,100 +1976,39 @@ public final class VLMEngine: ObservableObject {
         NSLog("[VLM-MEM] image generate start: %.0f MB", memoryBefore)
         emitVLMDiagnostic("vlm_mem image_generate_start mb=\(memoryBefore)")
 
-        var imageProcessorConfig = container.index.preflightResult.plan.imageProcessorConfiguration
-        if let imageTokenBudget = Self.environmentInt("EDGE_VLM_IMAGE_TOKEN_BUDGET"),
-           imageTokenBudget > 0 {
-            let plan = container.index.preflightResult.plan
-            let patchSize = imageProcessorConfig.patchSize
-                ?? plan.visionConfiguration.patchSize
-                ?? 16
-            let mergeSize = plan.visionConfiguration.spatialMergeSize
-                ?? imageProcessorConfig.mergeSize
-                ?? 2
-            let maxPixels = imageTokenBudget * patchSize * patchSize * mergeSize * mergeSize
-            let currentMax = imageProcessorConfig.maxPixels ?? (16_384 * 28 * 28)
-            if maxPixels < currentMax {
-                imageProcessorConfig.maxPixels = maxPixels
-            }
+        let imageProcessorConfig = nativeVLMImageProcessorConfiguration(
+            container: container,
+            emitDiagnostics: true
+        )
+        let preparedImageCacheKey = nativeVLMPreparedImageCacheKey(
+            inputs: inputs,
+            container: container,
+            imageProcessorConfig: imageProcessorConfig
+        )
+        var preparedImageFeatures = try await cachedOrPreloadedNativeVLMImageFeatures(
+            cacheKey: preparedImageCacheKey
+        )
+        let preprocessedImages: NativeVLMPreprocessedImages?
+        if let preparedImageFeatures {
+            preprocessedImages = nil
             emitVLMDiagnostic(
-                "vlm_image_token_budget_override budget=\(imageTokenBudget) patch=\(patchSize) merge=\(mergeSize) maxPixels=\(maxPixels) appliedMax=\(imageProcessorConfig.maxPixels ?? currentMax)"
+                "vlm_image_feature_prepared_reuse source=\(preparedImageFeatures.source) imageTokens=\(preparedImageFeatures.imageTokenCounts) shape=\(preparedImageFeatures.shape)"
+            )
+        } else {
+            preprocessedImages = try preprocessNativeVLMImages(
+                inputs: inputs,
+                container: container,
+                imageProcessorConfig: imageProcessorConfig,
+                cacheKey: preparedImageCacheKey,
+                memoryBefore: memoryBefore
             )
         }
-        let deviceRAMGB = DeviceProfile.current.totalRAMGB
-        if deviceRAMGB < 12 {
-            let safeCap = 1280 * 28 * 28
-            let currentMax = imageProcessorConfig.maxPixels ?? (16_384 * 28 * 28)
-            if currentMax > safeCap {
-                imageProcessorConfig.maxPixels = safeCap
-                NSLog("[VLM-MEM] clamped maxPixels %d → %d (device %d GB RAM)", currentMax, safeCap, deviceRAMGB)
-            }
-        }
-        let preprocessings = try inputs.map { input in
-            switch input {
-            case .url(let url):
-                return try QwenImagePreprocessor.preprocessImage(
-                    at: url,
-                    configuration: imageProcessorConfig
-                )
-            case .ciImage(let image):
-                return try QwenImagePreprocessor.preprocessCIImage(
-                    image,
-                    configuration: imageProcessorConfig
-                )
-            }
-        }
-        let afterPreprocess = DeviceProfile.captureMemorySnapshot().footprintMB
-        NSLog("[VLM-MEM] after image preprocess: %.0f MB (+%.0f)", afterPreprocess, afterPreprocess - memoryBefore)
-        emitVLMDiagnostic(
-            "vlm_mem after_image_preprocess mb=\(afterPreprocess) delta=\(afterPreprocess - memoryBefore)"
-        )
-
-        let resolvedPatchSize = imageProcessorConfig.patchSize
-            ?? container.index.preflightResult.plan.visionConfiguration.patchSize
-            ?? 16
-        let targetSizes = preprocessings.map { item in
-            "\(item.imageGridTHW.height * resolvedPatchSize)x\(item.imageGridTHW.width * resolvedPatchSize)"
-        }
-        emitVLMDiagnostic(
-            "vlm_mem image_target_sizes sizes=\(targetSizes) patch=\(resolvedPatchSize)"
-        )
-
-        let patchDim = try Self.patchDimension(preprocessings)
-        let totalPatchCount = preprocessings.reduce(0) { partial, item in
-            partial + item.pixelValuesShape[0]
-        }
-        NSLog("[VLM-MEM] patches=%d patchDim=%d grids=%@", totalPatchCount, patchDim, preprocessings.map(\.imageGridTHW).description)
-        emitVLMDiagnostic(
-            "vlm_mem image_patches patches=\(totalPatchCount) patchDim=\(patchDim) grids=\(preprocessings.map(\.imageGridTHW).description)"
-        )
-        let pixelValues = preprocessings.reduce(into: [Float]()) { result, item in
-            result.reserveCapacity(result.count + item.pixelValues.count)
-            result.append(contentsOf: item.pixelValues)
-        }
-        let grids = preprocessings.map(\.imageGridTHW)
-        let originalImageTokenCounts = try Self.imageTokenCounts(
-            for: grids,
-            plan: container.index.preflightResult.plan
-        )
-        let imageFeaturePrunePlan = NativeVLMImageFeaturePruner.makePlan(
-            imageTokenCounts: originalImageTokenCounts,
-            maxTokensPerImage: Self.environmentInt("EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS")
-        )
-        let imageTokenCounts = imageFeaturePrunePlan?.effectiveImageTokenCounts ?? originalImageTokenCounts
-        NSLog("[VLM-MEM] imageTokenCounts=%@, originalImageTokenCounts=%@, pixelValues=%.1f MB", imageTokenCounts.description, originalImageTokenCounts.description, Float(pixelValues.count * 4) / 1_048_576.0)
-        emitVLMDiagnostic(
-            "vlm_mem image_tokens counts=\(imageTokenCounts) originalCounts=\(originalImageTokenCounts) pixelValuesMB=\(String(format: "%.1f", Float(pixelValues.count * 4) / 1_048_576.0))"
-        )
-        if let imageFeaturePrunePlan, imageFeaturePrunePlan.isPruned {
-            emitVLMDiagnostic(
-                "vlm_image_feature_prune_plan strategy=uniform_row_major original=\(imageFeaturePrunePlan.originalImageTokenCounts) effective=\(imageFeaturePrunePlan.effectiveImageTokenCounts) selected=\(imageFeaturePrunePlan.selectedRowIndices.count)"
-            )
-        }
-
         let preserveStateUnloadWeightsExperiment = Self.environmentBool(
             "EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_EXPERIMENT"
         )
-        let originalTotalImageTokenCount = originalImageTokenCounts.reduce(0, +)
+        let imageTokenCounts = preparedImageFeatures?.imageTokenCounts
+            ?? preprocessedImages?.imageTokenCounts
+            ?? []
         let totalImageTokenCount = imageTokenCounts.reduce(0, +)
         let imageTokenID = try Self.tokenID(
             "<|image_pad|>",
@@ -1704,7 +2101,8 @@ public final class VLMEngine: ObservableObject {
 
         try Task.checkCancellation()
         if container.isCmlxDecoderLoaded {
-            if preserveStateUnloadWeightsExperiment {
+            let shouldTryAppendPlan = preserveStateUnloadWeightsExperiment || preparedImageFeatures != nil
+            if shouldTryAppendPlan {
                 let canReuseSession = nativeVLMCmlxSessionMatches(
                     dsrPolicies: dsrPolicies,
                     attentionQuantization: attentionQuantization,
@@ -1741,39 +2139,55 @@ public final class VLMEngine: ObservableObject {
                     emitVLMDiagnostic(
                         "vlm_scheme_d_append_plan_hit cached=\(plan.cachedTokensReused) suffix=\(plan.suffixTokenIds.count) fullPrompt=\(promptTokens.count)"
                     )
-                    emitVLMDiagnostic(
-                        "vlm_scheme_d_unload_begin reason=media_append_before_vision_load"
-                    )
-                    emitCmlxDecoderMemorySummary("scheme_d_before_unload")
-                    do {
-                        try container.unloadCmlxDecoderWeightsPreservingState()
-                        didUnloadDecoderWeightsPreservingState = true
-                        emitCmlxDecoderMemorySummary("scheme_d_after_unload")
-                        emitVLMDiagnostic("vlm_scheme_d_unload_done")
-                    } catch {
-                        appendPlan = nil
+                    if preparedImageFeatures == nil {
                         emitVLMDiagnostic(
-                            "vlm_scheme_d_fallback reason=unload_failed error=\(error)"
+                            "vlm_scheme_d_unload_begin reason=media_append_before_vision_load"
                         )
-                        releaseNativeVLMCmlxSession(
-                            container: container,
-                            reason: "scheme_d_unload_failed"
+                        emitCmlxDecoderMemorySummary("scheme_d_before_unload")
+                        do {
+                            try container.unloadCmlxDecoderWeightsPreservingState()
+                            didUnloadDecoderWeightsPreservingState = true
+                            emitCmlxDecoderMemorySummary("scheme_d_after_unload")
+                            emitVLMDiagnostic("vlm_scheme_d_unload_done")
+                        } catch {
+                            appendPlan = nil
+                            emitVLMDiagnostic(
+                                "vlm_scheme_d_fallback reason=unload_failed error=\(error)"
+                            )
+                            releaseNativeVLMCmlxSession(
+                                container: container,
+                                reason: "scheme_d_unload_failed"
+                            )
+                            promptCache.clear()
+                        }
+                    } else {
+                        emitVLMDiagnostic(
+                            "vlm_scheme_d_unload_skip reason=prepared_image_features"
                         )
-                        promptCache.clear()
                     }
                 case .failure(let reason):
                     emitVLMDiagnostic(
                         "vlm_scheme_d_fallback reason=\(reason)"
                     )
-                    releaseNativeVLMCmlxSession(
-                        container: container,
-                        reason: "scheme_d_append_plan_failed"
-                    )
-                    promptCache.clear()
+                    if preparedImageFeatures != nil {
+                        emitVLMDiagnostic(
+                            "vlm_cmlx_session_preserve reason=prepared_image_features_append_plan_failed"
+                        )
+                    } else {
+                        releaseNativeVLMCmlxSession(
+                            container: container,
+                            reason: "scheme_d_append_plan_failed"
+                        )
+                        promptCache.clear()
+                    }
                 }
             } else if Self.environmentBool("EDGE_VLM_PRESERVE_DECODER_FOR_VISION_EXPERIMENT") {
                 emitVLMDiagnostic(
                     "vlm_cmlx_session_preserve reason=media_generate_before_vision_load_experiment"
+                )
+            } else if preparedImageFeatures != nil {
+                emitVLMDiagnostic(
+                    "vlm_cmlx_session_preserve reason=prepared_image_features"
                 )
             } else {
                 releaseNativeVLMCmlxSession(
@@ -1783,61 +2197,27 @@ public final class VLMEngine: ObservableObject {
                 promptCache.clear()
             }
         }
-        if container.isCmlxVisionLoaded {
-            container.unloadCmlxVisionWeights()
-        }
-        let beforeVision = DeviceProfile.captureMemorySnapshot().footprintMB
-        NSLog("[VLM-MEM] before vision encoder load: %.0f MB", beforeVision)
-        emitVLMDiagnostic(
-            "vlm_mem before_vision_encoder_load mb=\(beforeVision) deltaFromStart=\(beforeVision - memoryBefore)"
-        )
-        try container.loadCmlxVisionWeights(
-            diagnosticSink: { [weak self] marker in
-                self?.emitVLMDiagnostic(marker)
-            }
-        )
-        let afterVisionLoad = DeviceProfile.captureMemorySnapshot().footprintMB
-        NSLog("[VLM-MEM] after vision encoder load: %.0f MB (+%.0f)", afterVisionLoad, afterVisionLoad - beforeVision)
-        emitVLMDiagnostic(
-            "vlm_mem after_vision_encoder_load mb=\(afterVisionLoad) delta=\(afterVisionLoad - beforeVision)"
-        )
 
-        let visionEncoding: EdgeMLXQwen35VisionEncoding
-        do {
-            defer {
-                container.unloadCmlxVisionWeights()
-                let afterUnload = DeviceProfile.captureMemorySnapshot().footprintMB
-                NSLog("[VLM-MEM] after vision encoder unload: %.0f MB", afterUnload)
+        if preparedImageFeatures == nil {
+            guard let preprocessedImages else {
+                throw EdgeRuntimeError.loadFailed("Native VLM image preprocessing result missing")
+            }
+            let encoded = try encodeNativeVLMImageFeatures(
+                preprocessed: preprocessedImages,
+                container: container,
+                memoryBefore: memoryBefore,
+                source: "generate"
+            )
+            preparedImageFeatures = encoded
+            storeNativeVLMPreparedImageFeatures(encoded)
+            if encoded.cacheKey != nil {
                 emitVLMDiagnostic(
-                    "vlm_mem after_vision_encoder_unload mb=\(afterUnload) deltaFromStart=\(afterUnload - memoryBefore)"
+                    "vlm_image_feature_cache_store imageTokens=\(encoded.imageTokenCounts) shape=\(encoded.shape)"
                 )
             }
-            visionEncoding = try container.visionEncode(
-                pixelValues: pixelValues,
-                pixelValuesShape: [totalPatchCount, patchDim],
-                gridTHW: grids
-            )
-            let afterVisionEncode = DeviceProfile.captureMemorySnapshot().footprintMB
-            NSLog("[VLM-MEM] after vision encode: %.0f MB (+%.0f from load)", afterVisionEncode, afterVisionEncode - afterVisionLoad)
+        } else {
             emitVLMDiagnostic(
-                "vlm_mem after_vision_encode mb=\(afterVisionEncode) deltaFromVisionLoad=\(afterVisionEncode - afterVisionLoad)"
-            )
-        }
-        guard visionEncoding.shape.first == originalTotalImageTokenCount
-        else {
-            throw EdgeRuntimeError.loadFailed("Native VLM vision encoder returned no image tokens")
-        }
-        let effectiveVisionEncoding = try NativeVLMImageFeaturePruner.apply(
-            plan: imageFeaturePrunePlan,
-            values: visionEncoding.values,
-            shape: visionEncoding.shape
-        )
-        guard effectiveVisionEncoding.shape.first == totalImageTokenCount else {
-            throw EdgeRuntimeError.loadFailed("Native VLM pruned image token count mismatch")
-        }
-        if let imageFeaturePrunePlan, imageFeaturePrunePlan.isPruned {
-            emitVLMDiagnostic(
-                "vlm_image_feature_prune_applied originalShape=\(visionEncoding.shape) effectiveShape=\(effectiveVisionEncoding.shape)"
+                "vlm_image_feature_encode_skip reason=prepared_image_features"
             )
         }
 
@@ -1899,11 +2279,14 @@ public final class VLMEngine: ObservableObject {
         }
 
         try Task.checkCancellation()
+        guard let preparedImageFeatures else {
+            throw EdgeRuntimeError.loadFailed("Native VLM prepared image features missing")
+        }
         var nextTokenID: Int? = try runNativeVLMImageFeaturePrefill(
             container: container,
             tokenIDs: prefillTokenIds,
-            imageFeatures: effectiveVisionEncoding.values,
-            imageFeatureShape: effectiveVisionEncoding.shape,
+            imageFeatures: preparedImageFeatures.values,
+            imageFeatureShape: preparedImageFeatures.shape,
             imageTokenID: imageTokenID,
             parameters: parameters
         )
