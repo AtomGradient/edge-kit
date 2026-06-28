@@ -92,6 +92,39 @@ final class VLMEngineNativeTests: XCTestCase {
         )
     }
 
+    func testNativeVLMImageFeaturePrunerBuildsUniformRowMajorPlan() {
+        let plan = VLMEngine.NativeVLMImageFeaturePruner.makePlan(
+            imageTokenCounts: [8, 3],
+            maxTokensPerImage: 4
+        )
+
+        XCTAssertEqual(plan?.originalImageTokenCounts, [8, 3])
+        XCTAssertEqual(plan?.effectiveImageTokenCounts, [4, 3])
+        XCTAssertEqual(plan?.selectedRowIndices, [0, 2, 5, 7, 8, 9, 10])
+        XCTAssertEqual(plan?.isPruned, true)
+    }
+
+    func testNativeVLMImageFeaturePrunerAppliesSelectedRows() throws {
+        let plan = VLMEngine.NativeVLMImageFeaturePruner.makePlan(
+            imageTokenCounts: [6],
+            maxTokensPerImage: 3
+        )
+        let values = (0..<24).map(Float.init)
+
+        let pruned = try VLMEngine.NativeVLMImageFeaturePruner.apply(
+            plan: plan,
+            values: values,
+            shape: [6, 4]
+        )
+
+        XCTAssertEqual(pruned.shape, [3, 4])
+        XCTAssertEqual(pruned.values, [
+            0, 1, 2, 3,
+            12, 13, 14, 15,
+            20, 21, 22, 23,
+        ])
+    }
+
     @MainActor
     func testNativeImageGeneratePizzaSmokeWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment[Self.smokeGate] == "1" else {

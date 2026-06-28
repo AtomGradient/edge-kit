@@ -171,6 +171,117 @@ public final class VLMEngine: ObservableObject {
         }
     }
 
+    struct NativeVLMImageFeaturePrunePlan: Equatable {
+        let originalImageTokenCounts: [Int]
+        let effectiveImageTokenCounts: [Int]
+        let selectedRowIndices: [Int]
+
+        var isPruned: Bool {
+            originalImageTokenCounts != effectiveImageTokenCounts
+        }
+    }
+
+    enum NativeVLMImageFeaturePruner {
+        static func makePlan(
+            imageTokenCounts: [Int],
+            maxTokensPerImage: Int?
+        ) -> NativeVLMImageFeaturePrunePlan? {
+            guard let maxTokensPerImage,
+                  maxTokensPerImage > 0,
+                  !imageTokenCounts.isEmpty,
+                  imageTokenCounts.allSatisfy({ $0 > 0 })
+            else {
+                return nil
+            }
+
+            var selectedRowIndices: [Int] = []
+            selectedRowIndices.reserveCapacity(imageTokenCounts.reduce(0) { total, count in
+                total + min(count, maxTokensPerImage)
+            })
+            var effectiveImageTokenCounts: [Int] = []
+            effectiveImageTokenCounts.reserveCapacity(imageTokenCounts.count)
+            var rowOffset = 0
+
+            for imageTokenCount in imageTokenCounts {
+                let effectiveCount = min(imageTokenCount, maxTokensPerImage)
+                effectiveImageTokenCounts.append(effectiveCount)
+                for localIndex in uniformRowIndices(
+                    sourceCount: imageTokenCount,
+                    targetCount: effectiveCount
+                ) {
+                    selectedRowIndices.append(rowOffset + localIndex)
+                }
+                rowOffset += imageTokenCount
+            }
+
+            return NativeVLMImageFeaturePrunePlan(
+                originalImageTokenCounts: imageTokenCounts,
+                effectiveImageTokenCounts: effectiveImageTokenCounts,
+                selectedRowIndices: selectedRowIndices
+            )
+        }
+
+        static func apply(
+            plan: NativeVLMImageFeaturePrunePlan?,
+            values: [Float],
+            shape: [Int]
+        ) throws -> EdgeMLXQwen35VisionEncoding {
+            guard let plan, plan.isPruned else {
+                return EdgeMLXQwen35VisionEncoding(values: values, shape: shape)
+            }
+            guard shape.count == 2,
+                  shape[0] == plan.originalImageTokenCounts.reduce(0, +),
+                  shape[1] > 0,
+                  values.count == shape[0] * shape[1]
+            else {
+                throw EdgeRuntimeError.loadFailed("Native VLM feature pruning shape mismatch")
+            }
+
+            let hiddenSize = shape[1]
+            var prunedValues: [Float] = []
+            prunedValues.reserveCapacity(plan.selectedRowIndices.count * hiddenSize)
+            for rowIndex in plan.selectedRowIndices {
+                guard rowIndex >= 0, rowIndex < shape[0] else {
+                    throw EdgeRuntimeError.loadFailed("Native VLM feature pruning index out of range")
+                }
+                let start = rowIndex * hiddenSize
+                prunedValues.append(contentsOf: values[start..<(start + hiddenSize)])
+            }
+            return EdgeMLXQwen35VisionEncoding(
+                values: prunedValues,
+                shape: [plan.selectedRowIndices.count, hiddenSize]
+            )
+        }
+
+        static func uniformRowIndices(sourceCount: Int, targetCount: Int) -> [Int] {
+            guard sourceCount > 0, targetCount > 0 else {
+                return []
+            }
+            guard targetCount < sourceCount else {
+                return Array(0..<sourceCount)
+            }
+            guard targetCount > 1 else {
+                return [sourceCount / 2]
+            }
+
+            var indices: [Int] = []
+            indices.reserveCapacity(targetCount)
+            var previous = -1
+            for targetIndex in 0..<targetCount {
+                var sourceIndex = Int(
+                    (Double(targetIndex) * Double(sourceCount - 1) / Double(targetCount - 1)).rounded()
+                )
+                sourceIndex = max(0, min(sourceCount - 1, sourceIndex))
+                if sourceIndex <= previous {
+                    sourceIndex = min(sourceCount - 1, previous + 1)
+                }
+                indices.append(sourceIndex)
+                previous = sourceIndex
+            }
+            return indices
+        }
+    }
+
     public init() {}
 
     public func loadLocal(directory: URL, onProgress: ((Double) -> Void)? = nil) async throws {
@@ -445,6 +556,15 @@ public final class VLMEngine: ObservableObject {
         default:
             return defaultValue
         }
+    }
+
+    private nonisolated static func environmentInt(_ name: String) -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else {
+            return nil
+        }
+        return Int(raw)
     }
 
     private func resetNativeVLMCmlxLedger() {
@@ -1399,6 +1519,24 @@ public final class VLMEngine: ObservableObject {
         emitVLMDiagnostic("vlm_mem image_generate_start mb=\(memoryBefore)")
 
         var imageProcessorConfig = container.index.preflightResult.plan.imageProcessorConfiguration
+        if let imageTokenBudget = Self.environmentInt("EDGE_VLM_IMAGE_TOKEN_BUDGET"),
+           imageTokenBudget > 0 {
+            let plan = container.index.preflightResult.plan
+            let patchSize = imageProcessorConfig.patchSize
+                ?? plan.visionConfiguration.patchSize
+                ?? 16
+            let mergeSize = plan.visionConfiguration.spatialMergeSize
+                ?? imageProcessorConfig.mergeSize
+                ?? 2
+            let maxPixels = imageTokenBudget * patchSize * patchSize * mergeSize * mergeSize
+            let currentMax = imageProcessorConfig.maxPixels ?? (16_384 * 28 * 28)
+            if maxPixels < currentMax {
+                imageProcessorConfig.maxPixels = maxPixels
+            }
+            emitVLMDiagnostic(
+                "vlm_image_token_budget_override budget=\(imageTokenBudget) patch=\(patchSize) merge=\(mergeSize) maxPixels=\(maxPixels) appliedMax=\(imageProcessorConfig.maxPixels ?? currentMax)"
+            )
+        }
         let deviceRAMGB = DeviceProfile.current.totalRAMGB
         if deviceRAMGB < 12 {
             let safeCap = 1280 * 28 * 28
@@ -1428,6 +1566,16 @@ public final class VLMEngine: ObservableObject {
             "vlm_mem after_image_preprocess mb=\(afterPreprocess) delta=\(afterPreprocess - memoryBefore)"
         )
 
+        let resolvedPatchSize = imageProcessorConfig.patchSize
+            ?? container.index.preflightResult.plan.visionConfiguration.patchSize
+            ?? 16
+        let targetSizes = preprocessings.map { item in
+            "\(item.imageGridTHW.height * resolvedPatchSize)x\(item.imageGridTHW.width * resolvedPatchSize)"
+        }
+        emitVLMDiagnostic(
+            "vlm_mem image_target_sizes sizes=\(targetSizes) patch=\(resolvedPatchSize)"
+        )
+
         let patchDim = try Self.patchDimension(preprocessings)
         let totalPatchCount = preprocessings.reduce(0) { partial, item in
             partial + item.pixelValuesShape[0]
@@ -1441,18 +1589,29 @@ public final class VLMEngine: ObservableObject {
             result.append(contentsOf: item.pixelValues)
         }
         let grids = preprocessings.map(\.imageGridTHW)
-        let imageTokenCounts = try Self.imageTokenCounts(
+        let originalImageTokenCounts = try Self.imageTokenCounts(
             for: grids,
             plan: container.index.preflightResult.plan
         )
-        NSLog("[VLM-MEM] imageTokenCounts=%@, pixelValues=%.1f MB", imageTokenCounts.description, Float(pixelValues.count * 4) / 1_048_576.0)
-        emitVLMDiagnostic(
-            "vlm_mem image_tokens counts=\(imageTokenCounts) pixelValuesMB=\(String(format: "%.1f", Float(pixelValues.count * 4) / 1_048_576.0))"
+        let imageFeaturePrunePlan = NativeVLMImageFeaturePruner.makePlan(
+            imageTokenCounts: originalImageTokenCounts,
+            maxTokensPerImage: Self.environmentInt("EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS")
         )
+        let imageTokenCounts = imageFeaturePrunePlan?.effectiveImageTokenCounts ?? originalImageTokenCounts
+        NSLog("[VLM-MEM] imageTokenCounts=%@, originalImageTokenCounts=%@, pixelValues=%.1f MB", imageTokenCounts.description, originalImageTokenCounts.description, Float(pixelValues.count * 4) / 1_048_576.0)
+        emitVLMDiagnostic(
+            "vlm_mem image_tokens counts=\(imageTokenCounts) originalCounts=\(originalImageTokenCounts) pixelValuesMB=\(String(format: "%.1f", Float(pixelValues.count * 4) / 1_048_576.0))"
+        )
+        if let imageFeaturePrunePlan, imageFeaturePrunePlan.isPruned {
+            emitVLMDiagnostic(
+                "vlm_image_feature_prune_plan strategy=uniform_row_major original=\(imageFeaturePrunePlan.originalImageTokenCounts) effective=\(imageFeaturePrunePlan.effectiveImageTokenCounts) selected=\(imageFeaturePrunePlan.selectedRowIndices.count)"
+            )
+        }
 
         let preserveStateUnloadWeightsExperiment = Self.environmentBool(
             "EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_EXPERIMENT"
         )
+        let originalTotalImageTokenCount = originalImageTokenCounts.reduce(0, +)
         let totalImageTokenCount = imageTokenCounts.reduce(0, +)
         let imageTokenID = try Self.tokenID(
             "<|image_pad|>",
@@ -1664,9 +1823,22 @@ public final class VLMEngine: ObservableObject {
                 "vlm_mem after_vision_encode mb=\(afterVisionEncode) deltaFromVisionLoad=\(afterVisionEncode - afterVisionLoad)"
             )
         }
-        guard visionEncoding.shape.first == totalImageTokenCount
+        guard visionEncoding.shape.first == originalTotalImageTokenCount
         else {
             throw EdgeRuntimeError.loadFailed("Native VLM vision encoder returned no image tokens")
+        }
+        let effectiveVisionEncoding = try NativeVLMImageFeaturePruner.apply(
+            plan: imageFeaturePrunePlan,
+            values: visionEncoding.values,
+            shape: visionEncoding.shape
+        )
+        guard effectiveVisionEncoding.shape.first == totalImageTokenCount else {
+            throw EdgeRuntimeError.loadFailed("Native VLM pruned image token count mismatch")
+        }
+        if let imageFeaturePrunePlan, imageFeaturePrunePlan.isPruned {
+            emitVLMDiagnostic(
+                "vlm_image_feature_prune_applied originalShape=\(visionEncoding.shape) effectiveShape=\(effectiveVisionEncoding.shape)"
+            )
         }
 
         if didUnloadDecoderWeightsPreservingState {
@@ -1730,8 +1902,8 @@ public final class VLMEngine: ObservableObject {
         var nextTokenID: Int? = try runNativeVLMImageFeaturePrefill(
             container: container,
             tokenIDs: prefillTokenIds,
-            imageFeatures: visionEncoding.values,
-            imageFeatureShape: visionEncoding.shape,
+            imageFeatures: effectiveVisionEncoding.values,
+            imageFeatureShape: effectiveVisionEncoding.shape,
             imageTokenID: imageTokenID,
             parameters: parameters
         )
