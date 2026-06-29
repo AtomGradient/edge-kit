@@ -80,7 +80,6 @@ public struct NeuralImprintPrefixRender: Sendable, Equatable {
 }
 
 public final class LLMEngine: ObservableObject {
-    private static let eosSamplingLogitPenalty: Float = 20
     public static let neuralImprintArtifactFileName = "neural_imprint.safetensors"
     public static let legacyPersonaKVArtifactFileName = "persona_kv.safetensors"
     public static let neuralImprintMetadataFileName = "neural_imprint_metadata.json"
@@ -181,55 +180,6 @@ public final class LLMEngine: ObservableObject {
             "enable_thinking": parameters.enableThinking,
             "preserve_thinking": parameters.preserveThinking,
         ]
-    }
-
-    nonisolated static func cmlxRepetitionContextTokenIds(
-        promptSessionTokenIds: [Int],
-        generatedTokenIds: [Int] = [],
-        contextSize: Int? = nil
-    ) -> [Int] {
-        var context = promptSessionTokenIds
-        context.reserveCapacity(promptSessionTokenIds.count + generatedTokenIds.count)
-        context.append(contentsOf: generatedTokenIds)
-        guard let contextSize else { return context }
-        guard contextSize > 0 else { return [] }
-        return Array(context.suffix(contextSize))
-    }
-
-    nonisolated static func qwenSamplingConfiguration(
-        parameters: EdgeGenerateParameters,
-        promptSessionTokenIds: [Int],
-        generatedTokenIds: [Int] = [],
-        endTokenIds: Set<Int> = []
-    ) -> QwenSamplingConfiguration {
-        QwenSamplingConfiguration(
-            temperature: parameters.temperature,
-            topK: parameters.topK,
-            topP: parameters.topP > 0 && parameters.topP < 1 ? parameters.topP : nil,
-            minP: parameters.minP,
-            repetitionPenalty: parameters.repetitionPenalty,
-            repetitionTokenIds: cmlxRepetitionContextTokenIds(
-                promptSessionTokenIds: promptSessionTokenIds,
-                generatedTokenIds: generatedTokenIds,
-                contextSize: parameters.repetitionContextSize
-            ),
-            presencePenalty: parameters.presencePenalty,
-            presenceTokenIds: cmlxRepetitionContextTokenIds(
-                promptSessionTokenIds: promptSessionTokenIds,
-                generatedTokenIds: generatedTokenIds,
-                contextSize: parameters.presenceContextSize
-            ),
-            frequencyPenalty: parameters.frequencyPenalty,
-            frequencyTokenIds: cmlxRepetitionContextTokenIds(
-                promptSessionTokenIds: promptSessionTokenIds,
-                generatedTokenIds: generatedTokenIds,
-                contextSize: parameters.frequencyContextSize
-            ),
-            endTokenIds: Array(endTokenIds),
-            generatedTokenCount: generatedTokenIds.count,
-            minimumGeneratedTokens: parameters.minimumGeneratedTokens,
-            eosPenaltyUntilToken: parameters.eosPenaltyUntilToken
-        )
     }
 
     private func emitDecodedTextIfNeeded(
@@ -445,7 +395,7 @@ public final class LLMEngine: ObservableObject {
             }
             nativeUseCmlxLazyDecode = options?.cmlxLazyDecodeEnabled
                 ?? Self.shouldEnableCmlxLazyDecodeByDefault(plan: plan)
-            nativeUseCmlxLazyTextSuffixPromptCache = Self.environmentBool(
+            nativeUseCmlxLazyTextSuffixPromptCache = NativeEnvironment.bool(
                 ["EDGE_CMLX_TEXT_SUFFIX_PROMPT_CACHE", "EDGE_TEXT_SUFFIX_PROMPT_CACHE"],
                 defaultValue: true
             )
@@ -761,7 +711,7 @@ public final class LLMEngine: ObservableObject {
         syncPrefill: Bool = false
     ) -> Int {
         let planned = planPrefillStepSize ?? 128
-        let requested = environmentInt(
+        let requested = NativeEnvironment.int(
             ["EDGE_NEURAL_IMPRINT_CAPTURE_PREFILL_STEP", "EDGE_CMLX_NEURAL_IMPRINT_CAPTURE_PREFILL_STEP"],
             defaultValue: 0,
             range: 0...4096
@@ -777,7 +727,7 @@ public final class LLMEngine: ObservableObject {
         memorySnapshot: DeviceProfile.MemorySnapshot,
         planSyncEval: Bool?
     ) -> Bool {
-        if let override = environmentBoolOverride([
+        if let override = NativeEnvironment.boolOverride([
             "EDGE_NEURAL_IMPRINT_CAPTURE_SYNC_PREFILL",
             "EDGE_CMLX_NEURAL_IMPRINT_CAPTURE_SYNC_PREFILL",
         ]) {
@@ -1174,44 +1124,6 @@ public final class LLMEngine: ObservableObject {
             }
         }
         return nil
-    }
-
-    private nonisolated static func environmentBool(
-        _ names: [String],
-        defaultValue: Bool
-    ) -> Bool {
-        environmentBoolOverride(names) ?? defaultValue
-    }
-
-    private nonisolated static func environmentBoolOverride(
-        _ names: [String]
-    ) -> Bool? {
-        let environment = ProcessInfo.processInfo.environment
-        for name in names {
-            guard let raw = environment[name], !raw.isEmpty else { continue }
-            switch raw.lowercased() {
-            case "1", "true", "yes", "on":
-                return true
-            case "0", "false", "no", "off":
-                return false
-            default:
-                return nil
-            }
-        }
-        return nil
-    }
-
-    private nonisolated static func environmentInt(
-        _ names: [String],
-        defaultValue: Int,
-        range: ClosedRange<Int>
-    ) -> Int {
-        let environment = ProcessInfo.processInfo.environment
-        for name in names {
-            guard let raw = environment[name], let value = Int(raw) else { continue }
-            return range.contains(value) ? value : defaultValue
-        }
-        return defaultValue
     }
 
     private nonisolated static func estimateIndexedSafetensorsBytes(directory: URL) -> Int? {
@@ -1937,7 +1849,7 @@ public final class LLMEngine: ObservableObject {
                 firstTokenSelectionStartedAt = Date()
                 diagnosticSink?("select_first_token_begin")
             }
-            let sampling = Self.qwenSamplingConfiguration(
+            let sampling = NativeCmlxSampling.qwenSamplingConfiguration(
                 parameters: parameters,
                 promptSessionTokenIds: nativeDecodeSessionTokenIds,
                 generatedTokenIds: generatedTokenIds,
@@ -2191,17 +2103,8 @@ public final class LLMEngine: ObservableObject {
             requestedEnabled: parameters.frogJumpEnabled,
             thinkingEnabled: parameters.enableThinking
         )
-        let requestedFrogJumpLayers = requestedFrogJumpPlan.enabled &&
-            requestedFrogJumpPlan.skipLayers.contains(12) &&
-            requestedFrogJumpPlan.skipLayers.contains(13)
-            ? [12, 13]
-            : []
-        let requestedFrogJumpMask = requestedFrogJumpLayers.reduce(UInt64.zero) { mask, layer in
-            mask | (UInt64(1) << UInt64(layer))
-        }
-        let requestedFrogJumpSummary = requestedFrogJumpLayers.isEmpty
-            ? "off"
-            : requestedFrogJumpLayers.map(String.init).joined(separator: ",")
+        let requestedFrogJumpMask = requestedFrogJumpPlan.layerMask
+        let requestedFrogJumpSummary = requestedFrogJumpPlan.layerSummary
         let cachedAttentionCacheQuantization =
             nativeCmlxLazyDecodeSessionAttentionCacheQuantization
         let canUpdateResidentDSRPolicies =
@@ -2233,7 +2136,7 @@ public final class LLMEngine: ObservableObject {
         } else {
             if nativeCmlxLazyDecodeSession != nil {
                 diagnosticSink?(
-                    "cmlx_lazy_session_release reason=dsr_kv_or_frog_jump_changed requestedLayers=\(dsrPolicies.count) cachedLayers=\(nativeCmlxLazyDecodeSessionDSRPolicies.count) requestedKV=\(Self.cmlxAttentionCacheQuantizationSummary(requestedAttentionCacheQuantization)) cachedKV=\(Self.cmlxAttentionCacheQuantizationSummary(cachedAttentionCacheQuantization)) requestedFrog=0x\(String(requestedFrogJumpMask, radix: 16)) cachedFrog=0x\(String(nativeCmlxLazyDecodeSessionFrogJumpLayerMask, radix: 16))"
+                    "cmlx_lazy_session_release reason=dsr_kv_or_frog_jump_changed requestedLayers=\(dsrPolicies.count) cachedLayers=\(nativeCmlxLazyDecodeSessionDSRPolicies.count) requestedKV=\(NativeCmlxAttentionCacheQuantization.summary(requestedAttentionCacheQuantization)) cachedKV=\(NativeCmlxAttentionCacheQuantization.summary(cachedAttentionCacheQuantization)) requestedFrog=0x\(String(requestedFrogJumpMask, radix: 16)) cachedFrog=0x\(String(nativeCmlxLazyDecodeSessionFrogJumpLayerMask, radix: 16))"
                 )
             }
             nativeCmlxLazyDecodeSession = nil
@@ -2258,33 +2161,33 @@ public final class LLMEngine: ObservableObject {
             nativeCmlxLazyDecodeSessionFrogJumpLayerMask = requestedFrogJumpMask
             session = created
             diagnosticSink?(
-                "cmlx_lazy_session_init_done floats=\(created.registeredFloatTensorCount) quantized=\(created.registeredQuantizedTensorCount) attentionKV=\(Self.cmlxAttentionCacheQuantizationSummary(requestedAttentionCacheQuantization)) frogJump=\(requestedFrogJumpSummary)"
+                "cmlx_lazy_session_init_done floats=\(created.registeredFloatTensorCount) quantized=\(created.registeredQuantizedTensorCount) attentionKV=\(NativeCmlxAttentionCacheQuantization.summary(requestedAttentionCacheQuantization)) frogJump=\(requestedFrogJumpSummary)"
             )
         }
         let sessionReadyAt = Date()
-        let cmlxEvalProfileEnabled = Self.environmentBool(
+        let cmlxEvalProfileEnabled = NativeEnvironment.bool(
             ["EDGE_CMLX_EVAL_PROFILE", "CMLX_EVAL_PROFILE", "EDGE_CMLX_METAL_PROFILE", "CMLX_METAL_PROFILE"],
             defaultValue: false
         )
-        let cmlxPrefillChunkDiagnosticsEnabled = Self.environmentBool(
+        let cmlxPrefillChunkDiagnosticsEnabled = NativeEnvironment.bool(
             ["EDGE_CMLX_PREFILL_CHUNK_DIAGNOSTICS", "CMLX_PREFILL_CHUNK_DIAGNOSTICS"],
             defaultValue: false
         )
-        let cmlxPrefillChunkProfileEnabled = Self.environmentBool(
+        let cmlxPrefillChunkProfileEnabled = NativeEnvironment.bool(
             ["EDGE_CMLX_PREFILL_CHUNK_PROFILE", "CMLX_PREFILL_CHUNK_PROFILE"],
             defaultValue: false
         )
-        let cmlxPrefillBarrierAvailableMB = Self.environmentInt(
+        let cmlxPrefillBarrierAvailableMB = NativeEnvironment.int(
             ["EDGE_CMLX_PREFILL_BARRIER_AVAIL_MB", "CMLX_PREFILL_BARRIER_AVAIL_MB"],
             defaultValue: 0,
             range: 0...65_536
         )
-        let cmlxPrefillBarrierMaxChunks = Self.environmentInt(
+        let cmlxPrefillBarrierMaxChunks = NativeEnvironment.int(
             ["EDGE_CMLX_PREFILL_BARRIER_MAX_CHUNKS", "CMLX_PREFILL_BARRIER_MAX_CHUNKS"],
             defaultValue: 0,
             range: 0...4_096
         )
-        let cmlxTokenTimingEnabled = Self.environmentBool(
+        let cmlxTokenTimingEnabled = NativeEnvironment.bool(
             ["EDGE_CMLX_TOKEN_TIMING", "CMLX_TOKEN_TIMING"],
             defaultValue: false
         )
@@ -2429,68 +2332,47 @@ public final class LLMEngine: ObservableObject {
         var cmlxSamplingRNG = EdgeSeededRandomNumberGenerator(seed: UInt64.random(in: 1...UInt64.max))
         try? session.clearRepetitionPenalty()
         try? session.clearEOSSamplingBias()
-        let samplingPenaltiesAreActive = parameters.repetitionPenalty != 1.0 ||
-            parameters.presencePenalty != 0.0 ||
-            parameters.frequencyPenalty != 0.0
-        let useSamplingPenalties = useSampledCmlxPath && samplingPenaltiesAreActive
-        let eosSamplingBiasRequested = parameters.minimumGeneratedTokens > 0 ||
-            parameters.eosPenaltyUntilToken > 0
-        let useEOSSamplingBias = useSampledCmlxPath &&
-            eosSamplingBiasRequested &&
-            !nativeEndTokenIds.isEmpty
-        func applyCmlxSamplingPenalties(
-            promptSessionTokenIds: [Int],
-            generatedTokenIds: [Int] = []
-        ) throws {
-            try session.setSamplingPenalties(
-                repetitionPenalty: parameters.repetitionPenalty,
-                repetitionContextTokenIds: Self.cmlxRepetitionContextTokenIds(
-                    promptSessionTokenIds: promptSessionTokenIds,
-                    generatedTokenIds: generatedTokenIds,
-                    contextSize: parameters.repetitionContextSize
-                ),
-                presencePenalty: parameters.presencePenalty,
-                presenceContextTokenIds: Self.cmlxRepetitionContextTokenIds(
-                    promptSessionTokenIds: promptSessionTokenIds,
-                    generatedTokenIds: generatedTokenIds,
-                    contextSize: parameters.presenceContextSize
-                ),
-                frequencyPenalty: parameters.frequencyPenalty,
-                frequencyContextTokenIds: Self.cmlxRepetitionContextTokenIds(
-                    promptSessionTokenIds: promptSessionTokenIds,
-                    generatedTokenIds: generatedTokenIds,
-                    contextSize: parameters.frequencyContextSize
+        let samplingPenaltyApplier = NativeCmlxSampling.PenaltyApplier(
+            parameters: parameters,
+            endTokenIds: nativeEndTokenIds,
+            setSamplingPenalties: { repetitionPenalty, repetitionTokenIds, presencePenalty, presenceTokenIds, frequencyPenalty, frequencyTokenIds in
+                try session.setSamplingPenalties(
+                    repetitionPenalty: repetitionPenalty,
+                    repetitionContextTokenIds: repetitionTokenIds,
+                    presencePenalty: presencePenalty,
+                    presenceContextTokenIds: presenceTokenIds,
+                    frequencyPenalty: frequencyPenalty,
+                    frequencyContextTokenIds: frequencyTokenIds
                 )
-            )
-        }
-        func applyCmlxEOSSamplingBias(generatedTokenCount: Int) throws {
-            guard useEOSSamplingBias else { return }
-            let suppress = generatedTokenCount < parameters.minimumGeneratedTokens
-            let logitPenalty = generatedTokenCount < parameters.eosPenaltyUntilToken
-                ? Self.eosSamplingLogitPenalty
-                : 0
-            if suppress || logitPenalty > 0 {
+            },
+            setEOSSamplingBias: { tokenIds, suppress, logitPenalty in
                 try session.setEOSSamplingBias(
-                    tokenIds: Array(nativeEndTokenIds),
+                    tokenIds: tokenIds,
                     suppress: suppress,
                     logitPenalty: logitPenalty
                 )
-            } else {
+            },
+            clearEOSSamplingBias: {
                 try session.clearEOSSamplingBias()
             }
-        }
+        )
+        let useSamplingPenalties = useSampledCmlxPath &&
+            samplingPenaltyApplier.samplingPenaltiesAreActive
+        let useEOSSamplingBias = useSampledCmlxPath &&
+            samplingPenaltyApplier.eosSamplingBiasRequested &&
+            !nativeEndTokenIds.isEmpty
         if useSamplingPenalties {
-            try applyCmlxSamplingPenalties(
+            try samplingPenaltyApplier.applySamplingPenalties(
                 promptSessionTokenIds: nativeDecodeSessionTokenIds + prefillTokens
             )
         }
         if useEOSSamplingBias {
-            try applyCmlxEOSSamplingBias(generatedTokenCount: 0)
+            try samplingPenaltyApplier.applyEOSSamplingBias(generatedTokenCount: 0)
         }
-        if samplingPenaltiesAreActive && !useSampledCmlxPath {
+        if samplingPenaltyApplier.samplingPenaltiesAreActive && !useSampledCmlxPath {
             diagnosticSink?("sampling_penalties_not_supported backend=cmlx_greedy")
         }
-        if eosSamplingBiasRequested && !useSampledCmlxPath {
+        if samplingPenaltyApplier.eosSamplingBiasRequested && !useSampledCmlxPath {
             diagnosticSink?("eos_sampling_bias_not_supported backend=cmlx_greedy")
         }
         defer {
@@ -2614,13 +2496,13 @@ public final class LLMEngine: ObservableObject {
                 try timedApplyCmlxCommandBufferLimits(contextLengthHint: contextHint)
                 if useSampledCmlxPath {
                     if useSamplingPenalties {
-                        try applyCmlxSamplingPenalties(
+                        try samplingPenaltyApplier.applySamplingPenalties(
                             promptSessionTokenIds: nativeDecodeSessionTokenIds,
                             generatedTokenIds: generatedTokenIds
                         )
                     }
                     if useEOSSamplingBias {
-                        try applyCmlxEOSSamplingBias(
+                        try samplingPenaltyApplier.applyEOSSamplingBias(
                             generatedTokenCount: generatedTokenIds.count
                         )
                     }
@@ -3022,13 +2904,6 @@ public final class LLMEngine: ObservableObject {
             groupSize: max(1, parameters.kvGroupSize),
             bits: bits
         )
-    }
-
-    private static func cmlxAttentionCacheQuantizationSummary(
-        _ quantization: NativeCmlxAttentionCacheQuantization?
-    ) -> String {
-        guard let quantization else { return "none" }
-        return "int\(quantization.bits)@\(quantization.groupSize)"
     }
 
     private func prepareNativeDecodeSession(

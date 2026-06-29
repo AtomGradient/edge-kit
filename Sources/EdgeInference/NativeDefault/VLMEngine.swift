@@ -36,8 +36,6 @@ extension VLMImagePolicy: CustomStringConvertible {
 }
 
 public final class VLMEngine: ObservableObject {
-    private static let eosSamplingLogitPenalty: Float = 20
-
     @Published public private(set) var state: EngineState = .idle
     @Published public private(set) var downloadProgress: Double = 0
     @Published public private(set) var lastPolicy: InferencePolicy.Resolved?
@@ -715,46 +713,6 @@ public final class VLMEngine: ObservableObject {
         NSLog("[VLM] %@", message)
     }
 
-    private nonisolated static func environmentBool(
-        _ name: String,
-        defaultValue: Bool = false
-    ) -> Bool {
-        guard let raw = ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return defaultValue
-        }
-        switch raw.lowercased() {
-        case "1", "true", "yes", "on":
-            return true
-        case "0", "false", "no", "off":
-            return false
-        default:
-            return defaultValue
-        }
-    }
-
-    private nonisolated static func environmentInt(_ name: String) -> Int? {
-        guard let raw = ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return nil
-        }
-        return Int(raw)
-    }
-
-    private nonisolated static func environmentInt(
-        _ name: String,
-        in environment: [String: String]
-    ) -> Int? {
-        guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return nil
-        }
-        return Int(raw)
-    }
-
     nonisolated static func nativeVLMImagePolicySettings(
         for policy: VLMImagePolicy,
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -782,13 +740,13 @@ public final class VLMEngine: ObservableObject {
                 return pruneTokens
             }
         }()
-        let envBudget = environmentInt(
+        let envBudget = NativeEnvironment.int(
             "EDGE_VLM_IMAGE_TOKEN_BUDGET",
-            in: environment
+            environment: environment
         )
-        let envPrune = environmentInt(
+        let envPrune = NativeEnvironment.int(
             "EDGE_VLM_IMAGE_FEATURE_PRUNE_TOKENS",
-            in: environment
+            environment: environment
         )
         let maxImageTokens = envBudget.map { $0 > 0 ? $0 : nil } ?? defaultMaxImageTokens
         let pruneTokens = envPrune.map { $0 > 0 ? $0 : nil } ?? defaultPruneTokens
@@ -1245,7 +1203,7 @@ public final class VLMEngine: ObservableObject {
 
         if !container.isCmlxDecoderLoaded {
             emitVLMDiagnostic(
-                "vlm_cmlx_session_init_begin dsrLayers=\(dsrPolicies.count) kv=\(Self.cmlxAttentionCacheQuantizationSummary(attentionQuantization)) frog=0x\(String(frogJumpMask, radix: 16)) limit=\(attentionCacheLimit.map(String.init) ?? "nil")"
+                "vlm_cmlx_session_init_begin dsrLayers=\(dsrPolicies.count) kv=\(NativeCmlxAttentionCacheQuantization.summary(attentionQuantization)) frog=0x\(String(frogJumpMask, radix: 16)) limit=\(attentionCacheLimit.map(String.init) ?? "nil")"
             )
             try container.loadCmlxDecoderWeights(
                 attentionCacheLimit: attentionCacheLimit,
@@ -1378,11 +1336,11 @@ public final class VLMEngine: ObservableObject {
             parameters: parameters,
             dsrPolicies: dsrPolicies
         )
-        let frogJumpMask = Self.frogJumpLayerMask(
+        let frogJumpMask = QwenFrogJumpPlan.compute(
             architecture: architecture,
             requestedEnabled: parameters.frogJumpEnabled,
             thinkingEnabled: parameters.enableThinking
-        )
+        ).layerMask
         let residentTokenCount = max(promptTokens.count, nativeVLMCmlxTokenIds.count)
         let residentKVCapacity = LLMEngine.kvCapacity(
             promptTokenCount: residentTokenCount,
@@ -1453,7 +1411,7 @@ public final class VLMEngine: ObservableObject {
         while generatedTokenIds.count < parameters.maxTokens {
             try Task.checkCancellation()
             let tokenId: Int
-            let sampling = LLMEngine.qwenSamplingConfiguration(
+            let sampling = NativeCmlxSampling.qwenSamplingConfiguration(
                 parameters: parameters,
                 promptSessionTokenIds: promptTokens,
                 generatedTokenIds: generatedTokenIds,
@@ -1629,7 +1587,7 @@ public final class VLMEngine: ObservableObject {
         }
 
         if hadMatchingSession,
-           Self.environmentBool("EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_TEXT_SMOKE_EXPERIMENT") {
+           NativeEnvironment.bool("EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_TEXT_SMOKE_EXPERIMENT") {
             let beforeSummary = (try? container.cmlxDecoderMemorySummary()) ?? "unavailable"
             emitVLMDiagnostic("vlm_scheme_d_text_smoke_unload_begin \(beforeSummary)")
             do {
@@ -1727,56 +1685,35 @@ public final class VLMEngine: ObservableObject {
         )
         try? container.clearCmlxRepetitionPenalty()
         try? container.clearCmlxEOSSamplingBias()
-        let samplingPenaltiesAreActive = parameters.repetitionPenalty != 1.0 ||
-            parameters.presencePenalty != 0.0 ||
-            parameters.frequencyPenalty != 0.0
-        let useSamplingPenalties = useSampledPath && samplingPenaltiesAreActive
-        let eosSamplingBiasRequested = parameters.minimumGeneratedTokens > 0 ||
-            parameters.eosPenaltyUntilToken > 0
-        let useEOSSamplingBias = useSampledPath &&
-            eosSamplingBiasRequested &&
-            !nativeEndTokenIds.isEmpty
-        func applyVLMCmlxSamplingPenalties(
-            promptSessionTokenIds: [Int],
-            generatedTokenIds: [Int] = []
-        ) throws {
-            try container.setCmlxSamplingPenalties(
-                repetitionPenalty: parameters.repetitionPenalty,
-                repetitionContextTokenIds: LLMEngine.cmlxRepetitionContextTokenIds(
-                    promptSessionTokenIds: promptSessionTokenIds,
-                    generatedTokenIds: generatedTokenIds,
-                    contextSize: parameters.repetitionContextSize
-                ),
-                presencePenalty: parameters.presencePenalty,
-                presenceContextTokenIds: LLMEngine.cmlxRepetitionContextTokenIds(
-                    promptSessionTokenIds: promptSessionTokenIds,
-                    generatedTokenIds: generatedTokenIds,
-                    contextSize: parameters.presenceContextSize
-                ),
-                frequencyPenalty: parameters.frequencyPenalty,
-                frequencyContextTokenIds: LLMEngine.cmlxRepetitionContextTokenIds(
-                    promptSessionTokenIds: promptSessionTokenIds,
-                    generatedTokenIds: generatedTokenIds,
-                    contextSize: parameters.frequencyContextSize
+        let samplingPenaltyApplier = NativeCmlxSampling.PenaltyApplier(
+            parameters: parameters,
+            endTokenIds: nativeEndTokenIds,
+            setSamplingPenalties: { repetitionPenalty, repetitionTokenIds, presencePenalty, presenceTokenIds, frequencyPenalty, frequencyTokenIds in
+                try container.setCmlxSamplingPenalties(
+                    repetitionPenalty: repetitionPenalty,
+                    repetitionContextTokenIds: repetitionTokenIds,
+                    presencePenalty: presencePenalty,
+                    presenceContextTokenIds: presenceTokenIds,
+                    frequencyPenalty: frequencyPenalty,
+                    frequencyContextTokenIds: frequencyTokenIds
                 )
-            )
-        }
-        func applyVLMCmlxEOSSamplingBias(generatedTokenCount: Int) throws {
-            guard useEOSSamplingBias else { return }
-            let suppress = generatedTokenCount < parameters.minimumGeneratedTokens
-            let logitPenalty: Float = generatedTokenCount < parameters.eosPenaltyUntilToken
-                ? Self.eosSamplingLogitPenalty
-                : 0
-            if suppress || logitPenalty > 0 {
+            },
+            setEOSSamplingBias: { tokenIds, suppress, logitPenalty in
                 try container.setCmlxEOSSamplingBias(
-                    tokenIds: Array(nativeEndTokenIds),
+                    tokenIds: tokenIds,
                     suppress: suppress,
                     logitPenalty: logitPenalty
                 )
-            } else {
+            },
+            clearEOSSamplingBias: {
                 try container.clearCmlxEOSSamplingBias()
             }
-        }
+        )
+        let useSamplingPenalties = useSampledPath &&
+            samplingPenaltyApplier.samplingPenaltiesAreActive
+        let useEOSSamplingBias = useSampledPath &&
+            samplingPenaltyApplier.eosSamplingBiasRequested &&
+            !nativeEndTokenIds.isEmpty
         defer {
             if useSamplingPenalties { try? container.clearCmlxRepetitionPenalty() }
             if useEOSSamplingBias { try? container.clearCmlxEOSSamplingBias() }
@@ -1792,12 +1729,12 @@ public final class VLMEngine: ObservableObject {
         )
         let residentPromptTokensAfterPrefill = nativeVLMCmlxTokenIds + prefillTokens
         if useSamplingPenalties {
-            try applyVLMCmlxSamplingPenalties(
+            try samplingPenaltyApplier.applySamplingPenalties(
                 promptSessionTokenIds: residentPromptTokensAfterPrefill
             )
         }
         if useEOSSamplingBias {
-            try applyVLMCmlxEOSSamplingBias(generatedTokenCount: 0)
+            try samplingPenaltyApplier.applyEOSSamplingBias(generatedTokenCount: 0)
         }
         try Task.checkCancellation()
         try applyNativeVLMCmlxCommandBufferLimits(
@@ -1857,13 +1794,13 @@ public final class VLMEngine: ObservableObject {
             if generatedTokenIds.count < parameters.maxTokens {
                 if useSampledPath {
                     if useSamplingPenalties {
-                        try applyVLMCmlxSamplingPenalties(
+                        try samplingPenaltyApplier.applySamplingPenalties(
                             promptSessionTokenIds: nativeVLMCmlxTokenIds,
                             generatedTokenIds: generatedTokenIds
                         )
                     }
                     if useEOSSamplingBias {
-                        try applyVLMCmlxEOSSamplingBias(
+                        try samplingPenaltyApplier.applyEOSSamplingBias(
                             generatedTokenCount: generatedTokenIds.count
                         )
                     }
@@ -2158,7 +2095,7 @@ public final class VLMEngine: ObservableObject {
                 memoryBefore: memoryBefore
             )
         }
-        let preserveStateUnloadWeightsExperiment = Self.environmentBool(
+        let preserveStateUnloadWeightsExperiment = NativeEnvironment.bool(
             "EDGE_VLM_PRESERVE_STATE_UNLOAD_WEIGHTS_EXPERIMENT"
         )
         let imageTokenCounts = preparedImageFeatures?.imageTokenCounts
@@ -2237,11 +2174,11 @@ public final class VLMEngine: ObservableObject {
             parameters: parameters,
             dsrPolicies: dsrPolicies
         )
-        let frogJumpMask = Self.frogJumpLayerMask(
+        let frogJumpMask = QwenFrogJumpPlan.compute(
             architecture: architecture,
             requestedEnabled: parameters.frogJumpEnabled,
             thinkingEnabled: parameters.enableThinking
-        )
+        ).layerMask
         let attentionCacheLimit = parameters.maxKVSize ?? parameters.dsrMaxCritical ?? kvCapacity
 
         var didUnloadDecoderWeightsPreservingState = false
@@ -2339,7 +2276,7 @@ public final class VLMEngine: ObservableObject {
                         promptCache.clear()
                     }
                 }
-            } else if Self.environmentBool("EDGE_VLM_PRESERVE_DECODER_FOR_VISION_EXPERIMENT") {
+            } else if NativeEnvironment.bool("EDGE_VLM_PRESERVE_DECODER_FOR_VISION_EXPERIMENT") {
                 emitVLMDiagnostic(
                     "vlm_cmlx_session_preserve reason=media_generate_before_vision_load_experiment"
                 )
@@ -2627,34 +2564,6 @@ public final class VLMEngine: ObservableObject {
             promptMessages.append(.user(visionBlock))
         }
         return promptMessages
-    }
-
-    private static func frogJumpLayerMask(
-        architecture: QwenHybridArchitecture,
-        requestedEnabled: Bool,
-        thinkingEnabled: Bool
-    ) -> UInt64 {
-        let plan = QwenFrogJumpPlan.compute(
-            architecture: architecture,
-            requestedEnabled: requestedEnabled,
-            thinkingEnabled: thinkingEnabled
-        )
-        guard plan.enabled,
-              plan.skipLayers.contains(12),
-              plan.skipLayers.contains(13)
-        else {
-            return 0
-        }
-        return [12, 13].reduce(UInt64.zero) { mask, layer in
-            mask | (UInt64(1) << UInt64(layer))
-        }
-    }
-
-    private static func cmlxAttentionCacheQuantizationSummary(
-        _ quantization: NativeCmlxAttentionCacheQuantization?
-    ) -> String {
-        guard let quantization else { return "none" }
-        return "int\(quantization.bits)@\(quantization.groupSize)"
     }
 
     private func _generateNativePending(_ message: String) -> AsyncThrowingStream<GenerateChunk, Error> {

@@ -173,20 +173,20 @@ final class LLMEngineTests: XCTestCase {
 
     func testCmlxRepetitionContextIncludesPromptAndGeneratedTokens() {
         XCTAssertEqual(
-            LLMEngine.cmlxRepetitionContextTokenIds(
+            NativeCmlxSampling.contextTokenIds(
                 promptSessionTokenIds: [10, 11, 12]
             ),
             [10, 11, 12]
         )
         XCTAssertEqual(
-            LLMEngine.cmlxRepetitionContextTokenIds(
+            NativeCmlxSampling.contextTokenIds(
                 promptSessionTokenIds: [10, 11, 12],
                 generatedTokenIds: [20, 21]
             ),
             [10, 11, 12, 20, 21]
         )
         XCTAssertEqual(
-            LLMEngine.cmlxRepetitionContextTokenIds(
+            NativeCmlxSampling.contextTokenIds(
                 promptSessionTokenIds: [10, 11, 12],
                 generatedTokenIds: [20, 21],
                 contextSize: 3
@@ -194,7 +194,7 @@ final class LLMEngineTests: XCTestCase {
             [12, 20, 21]
         )
         XCTAssertEqual(
-            LLMEngine.cmlxRepetitionContextTokenIds(
+            NativeCmlxSampling.contextTokenIds(
                 promptSessionTokenIds: [10, 11, 12],
                 generatedTokenIds: [20, 21],
                 contextSize: 0
