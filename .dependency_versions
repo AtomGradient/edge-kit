@@ -11,7 +11,7 @@
 #                              → swift-transformers
 #                              → GRDB
 
-edge_kit=1.0.0-rc102
+edge_kit=1.0.0-rc103
 edge_engine=1.0.0-rc143
 swift_transformers=1.3.2
 swift_huggingface=0.9.0
