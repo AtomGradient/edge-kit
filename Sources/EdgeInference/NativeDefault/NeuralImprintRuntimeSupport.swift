@@ -40,6 +40,16 @@ public struct NeuralImprintRuntimeCacheStatus: Equatable, Sendable {
     }
 }
 
+struct NeuralImprintRuntimeModelIdentityHashes {
+    let modelDirectoryPath: String
+    let modelArchitectureID: String
+    let modelConfigSHA256: String
+    let modelWeightsFingerprint: String
+    let tokenizerJSONSHA256: String
+    let tokenizerConfigSHA256: String
+    let chatTemplateSHA256: String
+}
+
 enum NeuralImprintRuntimeSupport {
     static let artifactFileName = "neural_imprint.safetensors"
     static let legacyArtifactFileName = "persona_kv.safetensors"
@@ -216,6 +226,184 @@ enum NeuralImprintRuntimeSupport {
         dsrPolicyCount == 0 &&
             !hasAttentionCacheQuantization &&
             frogJumpLayerMask == 0
+    }
+
+    static func prefillNeuralImprintCapture(
+        session: QwenCmlxLazyDecodeSession,
+        tokenIDs: [Int],
+        chunkSize: Int,
+        syncPrefill: Bool,
+        diagnosticSink: ((String) -> Void)? = nil
+    ) throws {
+        let step = max(1, chunkSize)
+        let chunkCount = Int(ceil(Double(tokenIDs.count) / Double(step)))
+        diagnosticSink?(
+            "neural_imprint_capture_prefill_begin total=\(tokenIDs.count) step=\(step) chunks=\(chunkCount) mode=\(syncPrefill ? "sync" : "async")"
+        )
+
+        var offset = 0
+        var chunkIndex = 0
+        while offset < tokenIDs.count {
+            let end = min(offset + step, tokenIDs.count)
+            let chunk = Array(tokenIDs[offset..<end])
+            chunkIndex += 1
+            if syncPrefill {
+                _ = try session.prefill(tokenIDs: chunk)
+            } else {
+                try session.prefillAsync(tokenIDs: chunk)
+            }
+            diagnosticSink?(
+                "neural_imprint_capture_prefill_chunk_done index=\(chunkIndex) tokens=\(chunk.count) final=\(end == tokenIDs.count)"
+            )
+            offset = end
+        }
+    }
+
+    static func captureArtifact(
+        request: NeuralImprintArtifactCaptureRequest,
+        modelDirectory: URL,
+        architecture: QwenHybridArchitecture,
+        modelID: String,
+        modelIdentityHashes: NeuralImprintRuntimeModelIdentityHashes,
+        session: QwenCmlxLazyDecodeSession,
+        capturePrefillStep: Int,
+        captureUsesSyncPrefill: Bool,
+        diagnosticPrefix: String = "",
+        diagnosticSink: ((String) -> Void)? = nil
+    ) throws -> NeuralImprintRuntimeCacheStatus {
+        func emit(_ marker: String) {
+            diagnosticSink?("\(diagnosticPrefix)\(marker)")
+        }
+
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: request.outputDirectory,
+            withIntermediateDirectories: true
+        )
+        let artifactURL = request.outputDirectory.appendingPathComponent(artifactFileName)
+        let metadataURL = request.outputDirectory.appendingPathComponent(metadataFileName)
+        let profileBodyURL = request.outputDirectory.appendingPathComponent(request.profileBodyFileName)
+        let toolSpecsURL = request.outputDirectory.appendingPathComponent(request.toolSpecsFileName)
+        emit("neural_imprint_capture_source_write_begin")
+        try Data(request.profileBody.utf8).write(to: profileBodyURL, options: [.atomic])
+        try request.toolSchemaSnapshot.jsonData.write(to: toolSpecsURL, options: [.atomic])
+        emit("neural_imprint_capture_source_write_done")
+
+        let prefixTokenCount = request.prefixTokenIDs.count
+        let profileBodySHA256 = sha256Text(request.profileBody)
+        let renderedPrefixSHA256 = sha256Text(request.renderedPrefix)
+        let prefixTokenIDsSHA256 = neuralImprintTokenIDsSHA256(request.prefixTokenIDs)
+        emit("neural_imprint_capture_header_begin")
+        let header = try neuralImprintArtifactHeader(
+            modelID: modelID,
+            modelDirectory: modelDirectory,
+            modelArchitectureID: modelIdentityHashes.modelArchitectureID,
+            modelConfigSHA256: modelIdentityHashes.modelConfigSHA256,
+            modelWeightsFingerprint: modelIdentityHashes.modelWeightsFingerprint,
+            tokenizerJSONSHA256: modelIdentityHashes.tokenizerJSONSHA256,
+            tokenizerConfigSHA256: modelIdentityHashes.tokenizerConfigSHA256,
+            chatTemplateSHA256: modelIdentityHashes.chatTemplateSHA256,
+            systemPromptSHA256: sha256Text(request.systemPrompt),
+            renderedPrefixSHA256: renderedPrefixSHA256,
+            prefixTokenIDsSHA256: prefixTokenIDsSHA256,
+            prefixTokenCount: prefixTokenCount,
+            toolSchemaSHA256: request.toolSchemaSnapshot.sha256,
+            profileBodySHA256: profileBodySHA256,
+            enableThinking: request.enableThinking,
+            cacheBackendVersion: request.cacheBackendVersion,
+            createdAt: request.createdAt,
+            createdBy: request.createdBy,
+            writerVersion: request.writerVersion,
+            minReaderVersion: request.minReaderVersion
+        )
+        emit("neural_imprint_capture_header_done")
+
+        try prefillNeuralImprintCapture(
+            session: session,
+            tokenIDs: request.prefixTokenIDs,
+            chunkSize: capturePrefillStep,
+            syncPrefill: captureUsesSyncPrefill,
+            diagnosticSink: { emit($0) }
+        )
+        emit("neural_imprint_capture_save_begin")
+        try session.session.saveNeuralImprintCache(
+            artifactURL: artifactURL,
+            metadata: header
+        )
+        emit("neural_imprint_capture_save_done")
+        emit("neural_imprint_capture_session_reset_begin")
+        try session.reset()
+        emit("neural_imprint_capture_session_reset_done")
+
+        emit("neural_imprint_capture_artifact_map_begin")
+        let artifact = try SafeTensorsShardFile(url: artifactURL)
+        emit("neural_imprint_capture_artifact_map_done")
+        emit("neural_imprint_capture_sidecar_payload_begin")
+        let sidecarPayload = try neuralImprintSidecarPayload(
+            artifactURL: artifactURL,
+            artifact: artifact,
+            request: request,
+            modelID: modelID,
+            architecture: architecture,
+            tokenizerJSONSHA256: modelIdentityHashes.tokenizerJSONSHA256,
+            tokenizerConfigSHA256: modelIdentityHashes.tokenizerConfigSHA256,
+            chatTemplateSHA256: modelIdentityHashes.chatTemplateSHA256,
+            renderedPrefixSHA256: renderedPrefixSHA256,
+            prefixTokenIDsSHA256: prefixTokenIDsSHA256,
+            profileBodySHA256: profileBodySHA256
+        )
+        emit("neural_imprint_capture_sidecar_payload_done")
+        emit("neural_imprint_capture_sidecar_encode_begin")
+        let sidecarData = try JSONSerialization.data(
+            withJSONObject: sidecarPayload,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        emit("neural_imprint_capture_sidecar_encode_done")
+        emit("neural_imprint_capture_sidecar_write_begin")
+        try sidecarData.write(to: metadataURL, options: [.atomic])
+        emit("neural_imprint_capture_sidecar_write_done")
+
+        emit("neural_imprint_capture_sidecar_load_begin")
+        let sidecar = try NeuralImprintSidecar.load(from: metadataURL)
+        emit("neural_imprint_capture_sidecar_load_done")
+        emit("neural_imprint_capture_requirements_begin")
+        let requirements = try neuralImprintCompatibilityRequirements(
+            modelDirectory: modelDirectory,
+            architecture: architecture,
+            artifactHeader: artifact.metadata,
+            modelArchitectureID: modelIdentityHashes.modelArchitectureID,
+            modelConfigSHA256: modelIdentityHashes.modelConfigSHA256,
+            modelWeightsFingerprint: modelIdentityHashes.modelWeightsFingerprint,
+            tokenizerJSONSHA256: modelIdentityHashes.tokenizerJSONSHA256,
+            tokenizerConfigSHA256: modelIdentityHashes.tokenizerConfigSHA256,
+            chatTemplateSHA256: modelIdentityHashes.chatTemplateSHA256
+        )
+        emit("neural_imprint_capture_requirements_done")
+        emit("neural_imprint_capture_validator_begin")
+        try NeuralImprintArtifactValidator.validate(
+            artifact: artifact,
+            sidecar: sidecar,
+            requirements: requirements
+        )
+        emit("neural_imprint_capture_validator_done")
+
+        emit("neural_imprint_capture_status_begin")
+        let status = NeuralImprintRuntimeCacheStatus(
+            directory: request.outputDirectory,
+            artifactURL: artifactURL,
+            metadataURL: metadataURL,
+            artifactSHA256: sidecar.artifactSHA256,
+            prefixTokenCount: prefixTokenCount,
+            modelID: modelID,
+            enableThinking: request.enableThinking,
+            cacheBackend: try requiredNeuralImprintHeader("cache_backend", in: artifact.metadata),
+            cacheBackendVersion: try requiredNeuralImprintHeader("cache_backend_version", in: artifact.metadata)
+        )
+        emit("neural_imprint_capture_status_done")
+        emit(
+            "neural_imprint_capture_done prefix=\(status.prefixTokenCount) artifactSHA256=\(status.artifactSHA256)"
+        )
+        return status
     }
 
     static func neuralImprintArtifactURL(
@@ -466,6 +654,21 @@ enum NeuralImprintRuntimeSupport {
             return modelType
         }
         throw EdgeRuntimeError.loadFailed("config.json is missing model_type")
+    }
+
+    static func computeModelIdentityHashes(
+        modelDirectory: URL
+    ) throws -> NeuralImprintRuntimeModelIdentityHashes {
+        let chatTemplateSHA256 = try neuralImprintChatTemplateSHA256(modelDirectory: modelDirectory)
+        return try NeuralImprintRuntimeModelIdentityHashes(
+            modelDirectoryPath: modelDirectory.standardizedFileURL.path,
+            modelArchitectureID: neuralImprintModelArchitectureIdentifier(modelDirectory: modelDirectory),
+            modelConfigSHA256: sha256File(modelDirectory.appendingPathComponent("config.json")),
+            modelWeightsFingerprint: neuralImprintModelWeightsFingerprint(modelDirectory: modelDirectory),
+            tokenizerJSONSHA256: sha256File(modelDirectory.appendingPathComponent("tokenizer.json")),
+            tokenizerConfigSHA256: sha256File(modelDirectory.appendingPathComponent("tokenizer_config.json")),
+            chatTemplateSHA256: chatTemplateSHA256
+        )
     }
 
     static func neuralImprintChatTemplateSHA256(

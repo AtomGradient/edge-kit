@@ -44,6 +44,110 @@ final class VLMEngineNativeTests: XCTestCase {
         }
     }
 
+    func testVLMNeuralImprintCacheStatusConstructsStableValue() {
+        let status = VLMEngine.NeuralImprintCacheStatus(
+            directory: URL(fileURLWithPath: "/artifact"),
+            artifactURL: URL(fileURLWithPath: "/artifact/neural_imprint.safetensors"),
+            metadataURL: URL(fileURLWithPath: "/artifact/neural_imprint_metadata.json"),
+            artifactSHA256: String(repeating: "a", count: 64),
+            prefixTokenCount: 2_438,
+            modelID: "Qwen3.5-9B-4bit",
+            enableThinking: false,
+            cacheBackend: "cmlx-full-cache",
+            cacheBackendVersion: "edge-engine 1.0.0-rc138"
+        )
+
+        XCTAssertEqual(status.modelID, "Qwen3.5-9B-4bit")
+        XCTAssertEqual(status.prefixTokenCount, 2_438)
+    }
+
+    func testVLMNeuralImprintCompatibleParametersDisableIncompatibleCacheFeatures() {
+        let requested = EdgeGenerateParameters(
+            temperature: 0.2,
+            topP: 0.9,
+            maxTokens: 64,
+            quantizedKVStart: 128,
+            kvBits: 4,
+            maxKVSize: 2_048,
+            prefillStepSize: 128,
+            useDSR: true,
+            dsrMaxCritical: 1_024,
+            dsrHeavyBudget: 256,
+            dsrRecentBudget: 128,
+            dsrEvictionInterval: 64,
+            frogJumpEnabled: true
+        )
+
+        let updated = VLMEngine.neuralImprintCompatibleParameters(requested)
+
+        XCTAssertEqual(updated.temperature, requested.temperature)
+        XCTAssertEqual(updated.maxTokens, requested.maxTokens)
+        XCTAssertFalse(updated.useDSR)
+        XCTAssertNil(updated.dsrMaxCritical)
+        XCTAssertNil(updated.dsrHeavyBudget)
+        XCTAssertNil(updated.dsrRecentBudget)
+        XCTAssertEqual(updated.dsrEvictionInterval, 0)
+        XCTAssertNil(updated.kvBits)
+        XCTAssertEqual(updated.quantizedKVStart, 0)
+        XCTAssertNil(updated.maxKVSize)
+        XCTAssertFalse(updated.frogJumpEnabled)
+    }
+
+    func testVLMNeuralImprintCapturePrefillStepIsDeviceConservative() {
+        XCTAssertEqual(
+            VLMEngine.neuralImprintCapturePrefillStep(
+                prefixTokenCount: 1_018,
+                planPrefillStepSize: 512
+            ),
+            128
+        )
+        XCTAssertEqual(
+            VLMEngine.neuralImprintCapturePrefillStep(
+                prefixTokenCount: 1_018,
+                planPrefillStepSize: 128,
+                syncPrefill: true
+            ),
+            32
+        )
+        XCTAssertEqual(
+            VLMEngine.neuralImprintCapturePrefillStep(
+                prefixTokenCount: 24,
+                planPrefillStepSize: 128,
+                syncPrefill: true
+            ),
+            24
+        )
+    }
+
+    @MainActor
+    func testVLMRestoreNeuralImprintCacheRequiresLoadedModel() {
+        let engine = VLMEngine()
+
+        XCTAssertThrowsError(
+            try engine.restoreNeuralImprintCache(from: URL(fileURLWithPath: "/missing"))
+        ) { error in
+            guard case EdgeRuntimeError.loadFailed(let reason) = error else {
+                XCTFail("unexpected error: \(error)")
+                return
+            }
+            XCTAssertTrue(reason.contains("No VLM model loaded"))
+        }
+    }
+
+    @MainActor
+    func testVLMRenderNeuralImprintPrefixRequiresLoadedModel() async {
+        let engine = VLMEngine()
+
+        do {
+            _ = try await engine.renderNeuralImprintPrefix(profileBody: "profile")
+            XCTFail("renderNeuralImprintPrefix should require a loaded VLM model")
+        } catch EdgeRuntimeError.loadFailed(let reason) {
+            XCTAssertTrue(reason.contains("No VLM model loaded"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     /// Non-gated regression guard for the 0.5 tok/s VLM text bug: temperature > 0
     /// (the default 0.7) must remain eligible for the fast Metal CMLX text path
     /// and not fall back to the slow Swift decoder. No model required.

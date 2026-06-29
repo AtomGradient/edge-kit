@@ -128,15 +128,7 @@ public final class LLMEngine: ObservableObject {
     private var cachedModelIdentityHashes: ModelIdentityHashes?
     public var diagnosticSink: ((String) -> Void)?
 
-    private struct ModelIdentityHashes {
-        let modelDirectoryPath: String
-        let modelArchitectureID: String
-        let modelConfigSHA256: String
-        let modelWeightsFingerprint: String
-        let tokenizerJSONSHA256: String
-        let tokenizerConfigSHA256: String
-        let chatTemplateSHA256: String
-    }
+    private typealias ModelIdentityHashes = NeuralImprintRuntimeModelIdentityHashes
 
     public init() {}
 
@@ -714,36 +706,6 @@ public final class LLMEngine: ObservableObject {
         return created
     }
 
-    private func prefillNeuralImprintCapture(
-        session: QwenCmlxLazyDecodeSession,
-        tokenIDs: [Int],
-        chunkSize: Int,
-        syncPrefill: Bool
-    ) throws {
-        let step = max(1, chunkSize)
-        let chunkCount = Int(ceil(Double(tokenIDs.count) / Double(step)))
-        diagnosticSink?(
-            "neural_imprint_capture_prefill_begin total=\(tokenIDs.count) step=\(step) chunks=\(chunkCount) mode=\(syncPrefill ? "sync" : "async")"
-        )
-
-        var offset = 0
-        var chunkIndex = 0
-        while offset < tokenIDs.count {
-            let end = min(offset + step, tokenIDs.count)
-            let chunk = Array(tokenIDs[offset..<end])
-            chunkIndex += 1
-            if syncPrefill {
-                _ = try session.prefill(tokenIDs: chunk)
-            } else {
-                try session.prefillAsync(tokenIDs: chunk)
-            }
-            diagnosticSink?(
-                "neural_imprint_capture_prefill_chunk_done index=\(chunkIndex) tokens=\(chunk.count) final=\(end == tokenIDs.count)"
-            )
-            offset = end
-        }
-    }
-
     @discardableResult
     public func captureNeuralImprintArtifact(
         request: NeuralImprintArtifactCaptureRequest
@@ -762,52 +724,11 @@ public final class LLMEngine: ObservableObject {
             throw EdgeRuntimeError.loadFailed("Native Qwen runtime is not initialized")
         }
 
-        let fileManager = FileManager.default
-        try fileManager.createDirectory(
-            at: request.outputDirectory,
-            withIntermediateDirectories: true
-        )
-        let artifactURL = request.outputDirectory.appendingPathComponent(Self.neuralImprintArtifactFileName)
-        let metadataURL = request.outputDirectory.appendingPathComponent(Self.neuralImprintMetadataFileName)
-        let profileBodyURL = request.outputDirectory.appendingPathComponent(request.profileBodyFileName)
-        let toolSpecsURL = request.outputDirectory.appendingPathComponent(request.toolSpecsFileName)
-        diagnosticSink?("neural_imprint_capture_source_write_begin")
-        try Data(request.profileBody.utf8).write(to: profileBodyURL, options: [.atomic])
-        try request.toolSchemaSnapshot.jsonData.write(to: toolSpecsURL, options: [.atomic])
-        diagnosticSink?("neural_imprint_capture_source_write_done")
-
         let prefixTokenCount = request.prefixTokenIDs.count
-        let profileBodySHA256 = Self.sha256Text(request.profileBody)
         let modelID = request.modelID ?? loadedConfig?.modelID ?? modelDirectory.lastPathComponent
         diagnosticSink?("neural_imprint_capture_model_identity_begin")
         let modelIdentityHashes = try modelIdentityHashes(for: modelDirectory)
         diagnosticSink?("neural_imprint_capture_model_identity_done")
-        let renderedPrefixSHA256 = Self.sha256Text(request.renderedPrefix)
-        let prefixTokenIDsSHA256 = Self.neuralImprintTokenIDsSHA256(request.prefixTokenIDs)
-        diagnosticSink?("neural_imprint_capture_header_begin")
-        let header = try Self.neuralImprintArtifactHeader(
-            modelID: modelID,
-            modelDirectory: modelDirectory,
-            modelArchitectureID: modelIdentityHashes.modelArchitectureID,
-            modelConfigSHA256: modelIdentityHashes.modelConfigSHA256,
-            modelWeightsFingerprint: modelIdentityHashes.modelWeightsFingerprint,
-            tokenizerJSONSHA256: modelIdentityHashes.tokenizerJSONSHA256,
-            tokenizerConfigSHA256: modelIdentityHashes.tokenizerConfigSHA256,
-            chatTemplateSHA256: modelIdentityHashes.chatTemplateSHA256,
-            systemPromptSHA256: Self.sha256Text(request.systemPrompt),
-            renderedPrefixSHA256: renderedPrefixSHA256,
-            prefixTokenIDsSHA256: prefixTokenIDsSHA256,
-            prefixTokenCount: prefixTokenCount,
-            toolSchemaSHA256: request.toolSchemaSnapshot.sha256,
-            profileBodySHA256: profileBodySHA256,
-            enableThinking: request.enableThinking,
-            cacheBackendVersion: request.cacheBackendVersion,
-            createdAt: request.createdAt,
-            createdBy: request.createdBy,
-            writerVersion: request.writerVersion,
-            minReaderVersion: request.minReaderVersion
-        )
-        diagnosticSink?("neural_imprint_capture_header_done")
 
         let captureMemorySnapshot = DeviceProfile.captureMemorySnapshot()
         let captureUsesSyncPrefill = Self.neuralImprintCaptureUsesSyncPrefill(
@@ -827,91 +748,17 @@ public final class LLMEngine: ObservableObject {
             bundleIndex: bundleIndex,
             runtime: runtime
         )
-        try prefillNeuralImprintCapture(
-            session: session,
-            tokenIDs: request.prefixTokenIDs,
-            chunkSize: capturePrefillStep,
-            syncPrefill: captureUsesSyncPrefill
-        )
-        diagnosticSink?("neural_imprint_capture_save_begin")
-        try session.session.saveNeuralImprintCache(
-            artifactURL: artifactURL,
-            metadata: header
-        )
-        diagnosticSink?("neural_imprint_capture_save_done")
-        diagnosticSink?("neural_imprint_capture_session_reset_begin")
-        try session.reset()
-        diagnosticSink?("neural_imprint_capture_session_reset_done")
-
-        diagnosticSink?("neural_imprint_capture_artifact_map_begin")
-        let artifact = try SafeTensorsShardFile(url: artifactURL)
-        diagnosticSink?("neural_imprint_capture_artifact_map_done")
-        diagnosticSink?("neural_imprint_capture_sidecar_payload_begin")
-        let sidecarPayload = try Self.neuralImprintSidecarPayload(
-            artifactURL: artifactURL,
-            artifact: artifact,
+        return try NeuralImprintRuntimeSupport.captureArtifact(
             request: request,
-            modelID: modelID,
-            architecture: architecture,
-            tokenizerJSONSHA256: modelIdentityHashes.tokenizerJSONSHA256,
-            tokenizerConfigSHA256: modelIdentityHashes.tokenizerConfigSHA256,
-            chatTemplateSHA256: modelIdentityHashes.chatTemplateSHA256,
-            renderedPrefixSHA256: renderedPrefixSHA256,
-            prefixTokenIDsSHA256: prefixTokenIDsSHA256,
-            profileBodySHA256: profileBodySHA256
-        )
-        diagnosticSink?("neural_imprint_capture_sidecar_payload_done")
-        diagnosticSink?("neural_imprint_capture_sidecar_encode_begin")
-        let sidecarData = try JSONSerialization.data(
-            withJSONObject: sidecarPayload,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        )
-        diagnosticSink?("neural_imprint_capture_sidecar_encode_done")
-        diagnosticSink?("neural_imprint_capture_sidecar_write_begin")
-        try sidecarData.write(to: metadataURL, options: [.atomic])
-        diagnosticSink?("neural_imprint_capture_sidecar_write_done")
-
-        diagnosticSink?("neural_imprint_capture_sidecar_load_begin")
-        let sidecar = try NeuralImprintSidecar.load(from: metadataURL)
-        diagnosticSink?("neural_imprint_capture_sidecar_load_done")
-        diagnosticSink?("neural_imprint_capture_requirements_begin")
-        let requirements = try Self.neuralImprintCompatibilityRequirements(
             modelDirectory: modelDirectory,
             architecture: architecture,
-            artifactHeader: artifact.metadata,
-            modelArchitectureID: modelIdentityHashes.modelArchitectureID,
-            modelConfigSHA256: modelIdentityHashes.modelConfigSHA256,
-            modelWeightsFingerprint: modelIdentityHashes.modelWeightsFingerprint,
-            tokenizerJSONSHA256: modelIdentityHashes.tokenizerJSONSHA256,
-            tokenizerConfigSHA256: modelIdentityHashes.tokenizerConfigSHA256,
-            chatTemplateSHA256: modelIdentityHashes.chatTemplateSHA256
-        )
-        diagnosticSink?("neural_imprint_capture_requirements_done")
-        diagnosticSink?("neural_imprint_capture_validator_begin")
-        try NeuralImprintArtifactValidator.validate(
-            artifact: artifact,
-            sidecar: sidecar,
-            requirements: requirements
-        )
-        diagnosticSink?("neural_imprint_capture_validator_done")
-
-        diagnosticSink?("neural_imprint_capture_status_begin")
-        let status = NeuralImprintCacheStatus(
-            directory: request.outputDirectory,
-            artifactURL: artifactURL,
-            metadataURL: metadataURL,
-            artifactSHA256: sidecar.artifactSHA256,
-            prefixTokenCount: prefixTokenCount,
             modelID: modelID,
-            enableThinking: request.enableThinking,
-            cacheBackend: try Self.requiredNeuralImprintHeader("cache_backend", in: artifact.metadata),
-            cacheBackendVersion: try Self.requiredNeuralImprintHeader("cache_backend_version", in: artifact.metadata)
+            modelIdentityHashes: modelIdentityHashes,
+            session: session,
+            capturePrefillStep: capturePrefillStep,
+            captureUsesSyncPrefill: captureUsesSyncPrefill,
+            diagnosticSink: diagnosticSink
         )
-        diagnosticSink?("neural_imprint_capture_status_done")
-        diagnosticSink?(
-            "neural_imprint_capture_done prefix=\(status.prefixTokenCount) artifactSHA256=\(status.artifactSHA256)"
-        )
-        return status
     }
 
     public func unload() {
@@ -977,16 +824,7 @@ public final class LLMEngine: ObservableObject {
     private static func computeModelIdentityHashes(
         modelDirectory: URL
     ) throws -> ModelIdentityHashes {
-        let chatTemplateSHA256 = try neuralImprintChatTemplateSHA256(modelDirectory: modelDirectory)
-        return try ModelIdentityHashes(
-            modelDirectoryPath: modelDirectory.standardizedFileURL.path,
-            modelArchitectureID: neuralImprintModelArchitectureIdentifier(modelDirectory: modelDirectory),
-            modelConfigSHA256: sha256File(modelDirectory.appendingPathComponent("config.json")),
-            modelWeightsFingerprint: neuralImprintModelWeightsFingerprint(modelDirectory: modelDirectory),
-            tokenizerJSONSHA256: sha256File(modelDirectory.appendingPathComponent("tokenizer.json")),
-            tokenizerConfigSHA256: sha256File(modelDirectory.appendingPathComponent("tokenizer_config.json")),
-            chatTemplateSHA256: chatTemplateSHA256
-        )
+        try NeuralImprintRuntimeSupport.computeModelIdentityHashes(modelDirectory: modelDirectory)
     }
 
     private func modelIdentityHashes(

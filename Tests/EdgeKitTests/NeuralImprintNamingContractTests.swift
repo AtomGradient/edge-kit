@@ -53,6 +53,14 @@ final class NeuralImprintNamingContractTests: XCTestCase {
         XCTAssertTrue(llmEngine.contains("public func restoreNeuralImprintCache"))
         XCTAssertTrue(llmEngine.contains("public func captureNeuralImprintArtifact"))
 
+        let vlmEngine = try Self.read(
+            "Sources/EdgeInference/NativeDefault/VLMEngine.swift",
+            root: root
+        )
+        XCTAssertTrue(vlmEngine.contains("public private(set) var activeNeuralImprintCache"))
+        XCTAssertTrue(vlmEngine.contains("public func restoreNeuralImprintCache"))
+        XCTAssertTrue(vlmEngine.contains("public func captureNeuralImprintArtifact"))
+
         let transport = try Self.read(
             "Sources/EdgeMesh/Inference/JointInferenceTransport.swift",
             root: root
@@ -76,7 +84,10 @@ final class NeuralImprintNamingContractTests: XCTestCase {
     private static func isExplicitLegacyBoundary(relativePath: String, line: String) -> Bool {
         let lower = line.lowercased()
         switch relativePath {
-        case "Sources/EdgeInference/NativeDefault/LLMEngine.swift":
+        case "Sources/EdgeInference/NativeDefault/NeuralImprintRuntimeSupport.swift":
+            return lower.contains("legacy")
+        case "Sources/EdgeInference/NativeDefault/LLMEngine.swift",
+             "Sources/EdgeInference/NativeDefault/VLMEngine.swift":
             return lower.contains("legacy")
         case "Sources/EdgeMesh/Inference/JointInferenceTransport.swift",
              "Sources/EdgeMesh/Lifecycle/DeviceLearningSnapshot.swift":

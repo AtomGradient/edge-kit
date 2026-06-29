@@ -72,6 +72,14 @@ private actor VLMNativeOperationSerializer {
 }
 
 public final class VLMEngine: ObservableObject {
+    public static let neuralImprintArtifactFileName = NeuralImprintRuntimeSupport.artifactFileName
+    public static let legacyPersonaKVArtifactFileName = NeuralImprintRuntimeSupport.legacyArtifactFileName
+    public static let neuralImprintMetadataFileName = NeuralImprintRuntimeSupport.metadataFileName
+    public static let legacyPersonaKVMetadataFileName = NeuralImprintRuntimeSupport.legacyMetadataFileName
+    public static let neuralImprintPrefixSplitSentinel = NeuralImprintRuntimeSupport.prefixSplitSentinel
+
+    public typealias NeuralImprintCacheStatus = NeuralImprintRuntimeCacheStatus
+
     @Published public private(set) var state: EngineState = .idle
     @Published public private(set) var downloadProgress: Double = 0
     @Published public private(set) var lastPolicy: InferencePolicy.Resolved?
@@ -82,6 +90,7 @@ public final class VLMEngine: ObservableObject {
     public private(set) var archInfo: ModelArchInfo?
     public private(set) var visionOffloaded: Bool = false
     public private(set) var defaultImagePolicy: VLMImagePolicy = .default
+    public private(set) var activeNeuralImprintCache: NeuralImprintCacheStatus?
     public let promptCache = PromptCacheManager()
 
     private var modelDirectory: URL?
@@ -420,6 +429,7 @@ public final class VLMEngine: ObservableObject {
         downloadProgress = 0
         onProgress?(0)
         defaultImagePolicy = imagePolicy
+        activeNeuralImprintCache = nil
         do {
             let index = try QwenVLMModelBundleIndex.load(from: directory)
             modelDirectory = directory
@@ -666,6 +676,139 @@ public final class VLMEngine: ObservableObject {
         return tokenizer.encode(text: text)
     }
 
+    public func renderNeuralImprintPrefix(
+        profileBody: String,
+        tools: [ToolSpec] = [],
+        parameters requestedParameters: EdgeGenerateParameters = .default
+    ) async throws -> NeuralImprintPrefixRender {
+        guard state == .ready else {
+            throw EdgeRuntimeError.loadFailed("No VLM model loaded")
+        }
+        guard let tokenizer = nativeTokenizer else {
+            throw EdgeRuntimeError.loadFailed("Native VLM tokenizer is not initialized")
+        }
+        return try NeuralImprintRuntimeSupport.renderPrefix(
+            profileBody: profileBody,
+            tools: tools,
+            parameters: requestedParameters,
+            tokenizer: tokenizer,
+            additionalContext: LLMEngine.chatTemplateContext(parameters:)
+        )
+    }
+
+    @discardableResult
+    public func restoreNeuralImprintCache(from directory: URL) throws -> NeuralImprintCacheStatus {
+        guard state == .ready else {
+            throw EdgeRuntimeError.loadFailed("No VLM model loaded")
+        }
+        guard let modelDirectory, let container = nativeContainer else {
+            throw EdgeRuntimeError.loadFailed("Native VLM runtime is not initialized")
+        }
+
+        let status = try NeuralImprintRuntimeSupport.loadCacheStatus(
+            directory: directory,
+            modelDirectory: modelDirectory,
+            architecture: container.index.languageIndex.architecture
+        )
+        activeNeuralImprintCache = status
+        releaseNativeVLMCmlxSession(
+            container: container,
+            reason: "neural_imprint_restore_configured"
+        )
+        if container.isDecoderLoaded {
+            _ = container.unloadDecoderWeights()
+            emitVLMDiagnostic("vlm_swift_decoder_unload reason=neural_imprint_restore_configured")
+        }
+        promptCache.clear()
+        clearNativeVLMPreparedImageCache()
+        emitVLMDiagnostic(
+            "vlm_neural_imprint_restore_configured prefix=\(status.prefixTokenCount) artifactSHA256=\(status.artifactSHA256)"
+        )
+        return status
+    }
+
+    public func unloadNeuralImprintCache() {
+        activeNeuralImprintCache = nil
+        if let container = nativeContainer {
+            releaseNativeVLMCmlxSession(
+                container: container,
+                reason: "neural_imprint_unloaded"
+            )
+        } else {
+            resetNativeVLMCmlxLedger()
+        }
+        promptCache.clear()
+        clearNativeVLMPreparedImageCache()
+    }
+
+    @discardableResult
+    public func captureNeuralImprintArtifact(
+        request: NeuralImprintArtifactCaptureRequest
+    ) async throws -> NeuralImprintCacheStatus {
+        guard state == .ready else {
+            throw EdgeRuntimeError.loadFailed("No VLM model loaded")
+        }
+        guard !request.prefixTokenIDs.isEmpty else {
+            throw QwenHybridModelReferenceError.emptyTokenIds
+        }
+        guard let modelDirectory, let container = nativeContainer else {
+            throw EdgeRuntimeError.loadFailed("Native VLM runtime is not initialized")
+        }
+
+        let architecture = container.index.languageIndex.architecture
+        let prefixTokenCount = request.prefixTokenIDs.count
+        let modelID = request.modelID ?? modelDirectory.lastPathComponent
+        emitVLMDiagnostic("vlm_neural_imprint_capture_model_identity_begin")
+        let modelIdentityHashes = try NeuralImprintRuntimeSupport.computeModelIdentityHashes(
+            modelDirectory: modelDirectory
+        )
+        emitVLMDiagnostic("vlm_neural_imprint_capture_model_identity_done")
+
+        let captureMemorySnapshot = DeviceProfile.captureMemorySnapshot()
+        let captureUsesSyncPrefill = Self.neuralImprintCaptureUsesSyncPrefill(
+            memorySnapshot: captureMemorySnapshot,
+            planSyncEval: currentPlan?.syncEval
+        )
+        let capturePrefillStep = Self.neuralImprintCapturePrefillStep(
+            prefixTokenCount: prefixTokenCount,
+            planPrefillStepSize: currentPlan?.prefillStepSize,
+            syncPrefill: captureUsesSyncPrefill
+        )
+        emitVLMDiagnostic(
+            "vlm_neural_imprint_capture_session_init_begin prefix=\(prefixTokenCount) prefillStep=\(capturePrefillStep) syncPrefill=\(captureUsesSyncPrefill) availableMB=\(captureMemorySnapshot.availableMB) footprintMB=\(captureMemorySnapshot.footprintMB) jetsamLimitMB=\(captureMemorySnapshot.jetsamLimitMB)"
+        )
+        if container.isCmlxDecoderLoaded {
+            releaseNativeVLMCmlxSession(
+                container: container,
+                reason: "neural_imprint_capture_requires_clean_session"
+            )
+        }
+        if container.isDecoderLoaded {
+            _ = container.unloadDecoderWeights()
+            emitVLMDiagnostic("vlm_swift_decoder_unload reason=neural_imprint_capture")
+        }
+        try applyNativeVLMCmlxCommandBufferLimits(contextLengthHint: capturePrefillStep)
+        let session = try QwenCmlxLazyDecodeSession(
+            bundleIndex: container.index.languageIndex,
+            runtime: container.runtime
+        )
+        emitVLMDiagnostic(
+            "vlm_neural_imprint_capture_session_init_done floats=\(session.registeredFloatTensorCount) quantized=\(session.registeredQuantizedTensorCount)"
+        )
+        return try NeuralImprintRuntimeSupport.captureArtifact(
+            request: request,
+            modelDirectory: modelDirectory,
+            architecture: architecture,
+            modelID: modelID,
+            modelIdentityHashes: modelIdentityHashes,
+            session: session,
+            capturePrefillStep: capturePrefillStep,
+            captureUsesSyncPrefill: captureUsesSyncPrefill,
+            diagnosticPrefix: "vlm_",
+            diagnosticSink: { [weak self] marker in self?.emitVLMDiagnostic(marker) }
+        )
+    }
+
     public func captureHiddenStates(tokens: [Int], targetLayer: Int) async throws -> [Float] {
         guard state == .ready else {
             throw EdgeRuntimeError.loadFailed("No VLM model loaded")
@@ -744,6 +887,7 @@ public final class VLMEngine: ObservableObject {
         nativeContainer = nil
         nativeTokenizer = nil
         nativeEndTokenIds = []
+        activeNeuralImprintCache = nil
         clearNativeVLMPreparedImageCache()
         resetNativeVLMCmlxLedger()
         turnCounter = 0
@@ -760,6 +904,34 @@ public final class VLMEngine: ObservableObject {
     private func emitVLMDiagnostic(_ message: String) {
         diagnosticSink?(message)
         NSLog("[VLM] %@", message)
+    }
+
+    static func neuralImprintCompatibleParameters(
+        _ parameters: EdgeGenerateParameters
+    ) -> EdgeGenerateParameters {
+        NeuralImprintRuntimeSupport.neuralImprintCompatibleParameters(parameters)
+    }
+
+    static func neuralImprintCapturePrefillStep(
+        prefixTokenCount: Int,
+        planPrefillStepSize: Int?,
+        syncPrefill: Bool = false
+    ) -> Int {
+        NeuralImprintRuntimeSupport.neuralImprintCapturePrefillStep(
+            prefixTokenCount: prefixTokenCount,
+            planPrefillStepSize: planPrefillStepSize,
+            syncPrefill: syncPrefill
+        )
+    }
+
+    static func neuralImprintCaptureUsesSyncPrefill(
+        memorySnapshot: DeviceProfile.MemorySnapshot,
+        planSyncEval: Bool?
+    ) -> Bool {
+        NeuralImprintRuntimeSupport.neuralImprintCaptureUsesSyncPrefill(
+            memorySnapshot: memorySnapshot,
+            planSyncEval: planSyncEval
+        )
     }
 
     nonisolated static func nativeVLMImagePolicySettings(
@@ -1334,6 +1506,14 @@ public final class VLMEngine: ObservableObject {
         }
 
         var parameters = requestedParameters
+        let neuralImprintStatus = activeNeuralImprintCache
+        if let neuralImprintStatus,
+           parameters.enableThinking != neuralImprintStatus.enableThinking {
+            throw EdgeRuntimeError.unsupportedFeature(
+                "VLM Neural Imprint enableThinking mismatch: artifact=\(neuralImprintStatus.enableThinking) request=\(parameters.enableThinking)"
+            )
+        }
+        let promptTools = neuralImprintStatus == nil ? tools : nil
         let promptMessages = messages.promptCacheMessages(
             preserveThinking: parameters.preserveThinking
         )
@@ -1341,7 +1521,7 @@ public final class VLMEngine: ObservableObject {
             messages: promptMessages.chatTemplateMessages(
                 preserveThinking: parameters.preserveThinking
             ),
-            tools: tools,
+            tools: promptTools,
             additionalContext: LLMEngine.chatTemplateContext(parameters: parameters)
         )
         let architecture = container.index.languageIndex.architecture
@@ -1373,12 +1553,18 @@ public final class VLMEngine: ObservableObject {
         if resolved.shouldPause {
             throw EdgeRuntimeError.thermalPause
         }
+        var policyReasonSuffix = ""
+        if neuralImprintStatus != nil {
+            parameters = Self.neuralImprintCompatibleParameters(parameters)
+            policyReasonSuffix += " | neuralImprint full-cache restore disables DSR/KV-quant/FrogJump"
+        }
         let dsrPolicies = try LLMEngine.makeDSRPolicies(
             parameters: parameters,
             architecture: architecture
         )
+        let neuralImprintPrefixTokenCount = neuralImprintStatus?.prefixTokenCount ?? 0
         let kvCapacity = LLMEngine.kvCapacity(
-            promptTokenCount: promptTokens.count,
+            promptTokenCount: neuralImprintPrefixTokenCount + promptTokens.count,
             maxTokenCount: parameters.maxTokens,
             parameters: parameters,
             architecture: architecture
@@ -1392,7 +1578,10 @@ public final class VLMEngine: ObservableObject {
             requestedEnabled: parameters.frogJumpEnabled,
             thinkingEnabled: parameters.enableThinking
         ).layerMask
-        let residentTokenCount = max(promptTokens.count, nativeVLMCmlxTokenIds.count)
+        let residentTokenCount = max(
+            neuralImprintPrefixTokenCount + promptTokens.count,
+            neuralImprintPrefixTokenCount + nativeVLMCmlxTokenIds.count
+        )
         let residentKVCapacity = LLMEngine.kvCapacity(
             promptTokenCount: residentTokenCount,
             maxTokenCount: parameters.maxTokens,
@@ -1409,13 +1598,15 @@ public final class VLMEngine: ObservableObject {
         if try await runNativeVLMCmlxTextGenerateIfPossible(
             messages: promptMessages,
             promptTokens: promptTokens,
-            tools: tools,
+            tools: promptTools,
             parameters: parameters,
             resolvedPolicy: resolvedPolicy,
+            policyReasonSuffix: policyReasonSuffix,
             dsrPolicies: dsrPolicies,
             attentionQuantization: attentionQuantization,
             frogJumpMask: frogJumpMask,
             attentionCacheLimit: attentionCacheLimit,
+            neuralImprintStatus: neuralImprintStatus,
             turn: turn,
             container: container,
             tokenizer: tokenizer,
@@ -1424,6 +1615,11 @@ public final class VLMEngine: ObservableObject {
             continuation: continuation
         ) {
             return
+        }
+        if neuralImprintStatus != nil {
+            throw EdgeRuntimeError.unsupportedFeature(
+                "VLM Neural Imprint restore requires CMLX text decode"
+            )
         }
 
         let decoderLoadStartedAt = Date()
@@ -1595,10 +1791,12 @@ public final class VLMEngine: ObservableObject {
         tools: [ToolSpec]?,
         parameters: EdgeGenerateParameters,
         resolvedPolicy: InferencePolicy.Resolved?,
+        policyReasonSuffix: String,
         dsrPolicies: [Int: QwenDSRKVCachePolicy],
         attentionQuantization: NativeCmlxAttentionCacheQuantization?,
         frogJumpMask: UInt64,
         attentionCacheLimit: Int?,
+        neuralImprintStatus: NeuralImprintCacheStatus?,
         turn: Int,
         container: QwenVLMNativeContainer,
         tokenizer: Tokenizer,
@@ -1617,12 +1815,14 @@ public final class VLMEngine: ObservableObject {
             releaseNativeVLMCmlxSession(container: container, reason: reason)
             return false
         }
-        let hadMatchingSession = container.isCmlxDecoderLoaded && nativeVLMCmlxSessionMatches(
-            dsrPolicies: dsrPolicies,
-            attentionQuantization: attentionQuantization,
-            frogJumpMask: frogJumpMask,
-            attentionCacheLimit: attentionCacheLimit
-        )
+        let hadMatchingSession = neuralImprintStatus == nil &&
+            container.isCmlxDecoderLoaded &&
+            nativeVLMCmlxSessionMatches(
+                dsrPolicies: dsrPolicies,
+                attentionQuantization: attentionQuantization,
+                frogJumpMask: frogJumpMask,
+                attentionCacheLimit: attentionCacheLimit
+            )
         do {
             try prepareNativeVLMCmlxSession(
                 container: container,
@@ -1663,7 +1863,17 @@ public final class VLMEngine: ObservableObject {
         var prefillTokens = promptTokens
         var cachedTokensReused = 0
         var promptCacheHit = false
-        if hadMatchingSession {
+        if let neuralImprintStatus {
+            try container.restoreCmlxNeuralImprintCache(
+                artifactURL: neuralImprintStatus.artifactURL,
+                prefixTokenCount: neuralImprintStatus.prefixTokenCount
+            )
+            nativeVLMCmlxTokenIds = []
+            nativeVLMCmlxContainsMediaContext = false
+            emitVLMDiagnostic(
+                "vlm_cmlx_neural_imprint_restore prefix=\(neuralImprintStatus.prefixTokenCount) artifactSHA256=\(neuralImprintStatus.artifactSHA256)"
+            )
+        } else if hadMatchingSession {
             if let reusablePrefix = NativePromptSessionReuse.reusablePrefixMatch(
                 cachedTokenIds: nativeVLMCmlxTokenIds,
                 promptTokenIds: promptTokens,
@@ -1770,13 +1980,17 @@ public final class VLMEngine: ObservableObject {
             if useEOSSamplingBias { try? container.clearCmlxEOSSamplingBias() }
         }
 
-        if !promptCacheHit {
+        if neuralImprintStatus == nil && !promptCacheHit {
             _ = try container.resetCmlxDecoder()
             nativeVLMCmlxTokenIds = []
             nativeVLMCmlxContainsMediaContext = false
         }
+        let neuralImprintPrefixTokenCount = neuralImprintStatus?.prefixTokenCount ?? 0
+        let prefillMode = neuralImprintStatus != nil
+            ? "neural_imprint"
+            : (promptCacheHit ? "incremental" : "full")
         emitVLMDiagnostic(
-            "vlm_cmlx_text_prefill_begin tokens=\(prefillTokens.count) mode=\(promptCacheHit ? "incremental" : "full") cached=\(cachedTokensReused) decode=\(useSampledPath ? "sampled" : "greedy")"
+            "vlm_cmlx_text_prefill_begin tokens=\(prefillTokens.count) mode=\(prefillMode) cached=\(cachedTokensReused) neuralImprintPrefix=\(neuralImprintPrefixTokenCount) decode=\(useSampledPath ? "sampled" : "greedy")"
         )
         let residentPromptTokensAfterPrefill = nativeVLMCmlxTokenIds + prefillTokens
         if useSamplingPenalties {
@@ -1789,7 +2003,7 @@ public final class VLMEngine: ObservableObject {
         }
         try Task.checkCancellation()
         try applyNativeVLMCmlxCommandBufferLimits(
-            contextLengthHint: nativeVLMCmlxTokenIds.count + prefillTokens.count
+            contextLengthHint: neuralImprintPrefixTokenCount + nativeVLMCmlxTokenIds.count + prefillTokens.count
         )
         var nextTokenID: Int? = try runNativeVLMCmlxTokenPrefill(
             container: container,
@@ -1855,6 +2069,11 @@ public final class VLMEngine: ObservableObject {
                             generatedTokenCount: generatedTokenIds.count
                         )
                     }
+                    try applyNativeVLMCmlxCommandBufferLimits(
+                        contextLengthHint: neuralImprintPrefixTokenCount +
+                            nativeVLMCmlxTokenIds.count +
+                            generatedTokenIds.count
+                    )
                     nextTokenID = try container.nextSampledCmlxToken(
                         temperature: parameters.temperature,
                         topK: cmlxTopK,
@@ -1863,6 +2082,11 @@ public final class VLMEngine: ObservableObject {
                         seed: cmlxSamplingRNG.next()
                     )
                 } else {
+                    try applyNativeVLMCmlxCommandBufferLimits(
+                        contextLengthHint: neuralImprintPrefixTokenCount +
+                            nativeVLMCmlxTokenIds.count +
+                            generatedTokenIds.count
+                    )
                     nextTokenID = try container.decodeCmlxStep(tokenID: tokenID)
                 }
             } else {
@@ -1899,6 +2123,7 @@ public final class VLMEngine: ObservableObject {
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
             policyReasoning: (resolvedPolicy?.reasoning ?? "policy unavailable")
+                + policyReasonSuffix
                 + " | nativeVLMTextCmlx=\(useSampledPath ? "sampled" : "greedy")",
             promptCacheHit: promptCacheHit,
             cachedTokensReused: cachedTokensReused,
@@ -2109,6 +2334,16 @@ public final class VLMEngine: ObservableObject {
             }
         }
 
+        var parameters = requestedParameters
+        let neuralImprintStatus = activeNeuralImprintCache
+        if let neuralImprintStatus,
+           parameters.enableThinking != neuralImprintStatus.enableThinking {
+            throw EdgeRuntimeError.unsupportedFeature(
+                "VLM Neural Imprint enableThinking mismatch: artifact=\(neuralImprintStatus.enableThinking) request=\(parameters.enableThinking)"
+            )
+        }
+        let promptTools = neuralImprintStatus == nil ? tools : nil
+
         let startedAt = Date()
         let memoryBefore = DeviceProfile.captureMemorySnapshot().footprintMB
         NSLog("[VLM-MEM] image generate start: %.0f MB", memoryBefore)
@@ -2161,7 +2396,7 @@ public final class VLMEngine: ObservableObject {
             fallback: 248_056
         )
         let promptMessages = messages.promptCacheMessages(
-            preserveThinking: requestedParameters.preserveThinking
+            preserveThinking: parameters.preserveThinking
         )
         let mediaPromptMessages = try Self.makeNativeVLMImagePromptMessages(
             messages: promptMessages,
@@ -2171,8 +2406,8 @@ public final class VLMEngine: ObservableObject {
             messages: promptMessages,
             imageTokenCounts: imageTokenCounts,
             tokenizer: tokenizer,
-            tools: tools,
-            parameters: requestedParameters
+            tools: promptTools,
+            parameters: parameters
         )
         let placeholderCount = promptTokens.reduce(0) { count, token in
             count + (token == imageTokenID ? 1 : 0)
@@ -2185,7 +2420,6 @@ public final class VLMEngine: ObservableObject {
             )
         }
 
-        var parameters = requestedParameters
         let architecture = container.index.languageIndex.architecture
         let arch = archInfo ?? ModelArchInfo.fallback(
             modelSizeGB: LLMEngine.estimateModelSizeGB(
@@ -2213,12 +2447,18 @@ public final class VLMEngine: ObservableObject {
         if resolved.shouldPause {
             throw EdgeRuntimeError.thermalPause
         }
+        var policyReasonSuffix = ""
+        if neuralImprintStatus != nil {
+            parameters = Self.neuralImprintCompatibleParameters(parameters)
+            policyReasonSuffix += " | neuralImprint full-cache restore disables DSR/KV-quant/FrogJump"
+        }
         let dsrPolicies = try LLMEngine.makeDSRPolicies(
             parameters: parameters,
             architecture: architecture
         )
+        let neuralImprintPrefixTokenCount = neuralImprintStatus?.prefixTokenCount ?? 0
         let kvCapacity = LLMEngine.kvCapacity(
-            promptTokenCount: promptTokens.count,
+            promptTokenCount: neuralImprintPrefixTokenCount + promptTokens.count,
             maxTokenCount: parameters.maxTokens,
             parameters: parameters,
             architecture: architecture
@@ -2246,106 +2486,113 @@ public final class VLMEngine: ObservableObject {
 
         try Task.checkCancellation()
         if container.isCmlxDecoderLoaded {
-            let shouldTryAppendPlan = preserveStateUnloadWeightsExperiment || preparedImageFeatures != nil
-            if shouldTryAppendPlan {
-                let canReuseSession = nativeVLMCmlxSessionMatches(
-                    dsrPolicies: dsrPolicies,
-                    attentionQuantization: attentionQuantization,
-                    frogJumpMask: frogJumpMask,
-                    attentionCacheLimit: attentionCacheLimit
+            if neuralImprintStatus != nil {
+                releaseNativeVLMCmlxSession(
+                    container: container,
+                    reason: "neural_imprint_media_generate_before_vision_load"
                 )
-                let planResult: NativeVLMImageAppendPlanResult
-                if !(tools?.isEmpty ?? true) {
-                    planResult = .failure("tools_present")
-                } else if canReuseSession {
-                    planResult = NativeVLMImageAppendPlanner.makePlan(
-                        cachedTokenIds: nativeVLMCmlxTokenIds,
-                        currentPromptTokenIds: promptTokens,
-                        skippableCachedTokenSequences: LLMEngine.qwenThinkingSentinelTokenSequences(
-                            tokenizer: tokenizer
-                        ),
-                        previousPromptMessages: nativeVLMCmlxPromptMessages,
-                        lastAssistantText: nativeVLMCmlxLastAssistantText,
-                        currentMediaPromptMessages: mediaPromptMessages,
-                        imageTokenID: imageTokenID,
-                        totalImageTokenCount: totalImageTokenCount,
-                        enableThinking: parameters.enableThinking,
-                        encodeSuffix: { text in
-                            tokenizer.encode(text: text, addSpecialTokens: false)
-                        }
+                promptCache.clear()
+            } else {
+                let shouldTryAppendPlan = preserveStateUnloadWeightsExperiment || preparedImageFeatures != nil
+                if shouldTryAppendPlan {
+                    let canReuseSession = nativeVLMCmlxSessionMatches(
+                        dsrPolicies: dsrPolicies,
+                        attentionQuantization: attentionQuantization,
+                        frogJumpMask: frogJumpMask,
+                        attentionCacheLimit: attentionCacheLimit
                     )
-                } else {
-                    planResult = .failure("session_config_mismatch")
-                }
-
-                switch planResult {
-                case .success(let plan):
-                    appendPlan = plan
-                    emitVLMDiagnostic(
-                        "vlm_scheme_d_append_plan_hit cached=\(plan.cachedTokensReused) suffix=\(plan.suffixTokenIds.count) fullPrompt=\(promptTokens.count)"
-                    )
-                    if preparedImageFeatures == nil {
-                        emitVLMDiagnostic(
-                            "vlm_scheme_d_unload_begin reason=media_append_before_vision_load"
+                    let planResult: NativeVLMImageAppendPlanResult
+                    if !(promptTools?.isEmpty ?? true) {
+                        planResult = .failure("tools_present")
+                    } else if canReuseSession {
+                        planResult = NativeVLMImageAppendPlanner.makePlan(
+                            cachedTokenIds: nativeVLMCmlxTokenIds,
+                            currentPromptTokenIds: promptTokens,
+                            skippableCachedTokenSequences: LLMEngine.qwenThinkingSentinelTokenSequences(
+                                tokenizer: tokenizer
+                            ),
+                            previousPromptMessages: nativeVLMCmlxPromptMessages,
+                            lastAssistantText: nativeVLMCmlxLastAssistantText,
+                            currentMediaPromptMessages: mediaPromptMessages,
+                            imageTokenID: imageTokenID,
+                            totalImageTokenCount: totalImageTokenCount,
+                            enableThinking: parameters.enableThinking,
+                            encodeSuffix: { text in
+                                tokenizer.encode(text: text, addSpecialTokens: false)
+                            }
                         )
-                        emitCmlxDecoderMemorySummary("scheme_d_before_unload")
-                        do {
-                            try container.unloadCmlxDecoderWeightsPreservingState()
-                            didUnloadDecoderWeightsPreservingState = true
-                            emitCmlxDecoderMemorySummary("scheme_d_after_unload")
-                            emitVLMDiagnostic("vlm_scheme_d_unload_done")
-                        } catch {
-                            appendPlan = nil
+                    } else {
+                        planResult = .failure("session_config_mismatch")
+                    }
+
+                    switch planResult {
+                    case .success(let plan):
+                        appendPlan = plan
+                        emitVLMDiagnostic(
+                            "vlm_scheme_d_append_plan_hit cached=\(plan.cachedTokensReused) suffix=\(plan.suffixTokenIds.count) fullPrompt=\(promptTokens.count)"
+                        )
+                        if preparedImageFeatures == nil {
                             emitVLMDiagnostic(
-                                "vlm_scheme_d_fallback reason=unload_failed error=\(error)"
+                                "vlm_scheme_d_unload_begin reason=media_append_before_vision_load"
                             )
+                            emitCmlxDecoderMemorySummary("scheme_d_before_unload")
+                            do {
+                                try container.unloadCmlxDecoderWeightsPreservingState()
+                                didUnloadDecoderWeightsPreservingState = true
+                                emitCmlxDecoderMemorySummary("scheme_d_after_unload")
+                                emitVLMDiagnostic("vlm_scheme_d_unload_done")
+                            } catch {
+                                appendPlan = nil
+                                emitVLMDiagnostic(
+                                    "vlm_scheme_d_fallback reason=unload_failed error=\(error)"
+                                )
+                                releaseNativeVLMCmlxSession(
+                                    container: container,
+                                    reason: "scheme_d_unload_failed"
+                                )
+                                promptCache.clear()
+                            }
+                        } else {
+                            emitVLMDiagnostic(
+                                "vlm_scheme_d_unload_skip reason=prepared_image_features"
+                            )
+                        }
+                    case .failure(let reason):
+                        emitVLMDiagnostic(
+                            "vlm_scheme_d_fallback reason=\(reason)"
+                        )
+                        if preparedImageFeatures != nil {
+                            emitVLMDiagnostic(
+                                "vlm_prepared_hit_append_fallback reason=\(reason)"
+                            )
+                            emitVLMDiagnostic(
+                                "vlm_cmlx_session_preserve reason=prepared_image_features_append_plan_failed"
+                            )
+                        } else {
                             releaseNativeVLMCmlxSession(
                                 container: container,
-                                reason: "scheme_d_unload_failed"
+                                reason: "scheme_d_append_plan_failed"
                             )
                             promptCache.clear()
                         }
-                    } else {
-                        emitVLMDiagnostic(
-                            "vlm_scheme_d_unload_skip reason=prepared_image_features"
-                        )
                     }
-                case .failure(let reason):
+                } else if NativeEnvironment.bool("EDGE_VLM_PRESERVE_DECODER_FOR_VISION_EXPERIMENT") {
                     emitVLMDiagnostic(
-                        "vlm_scheme_d_fallback reason=\(reason)"
+                        "vlm_cmlx_session_preserve reason=media_generate_before_vision_load_experiment"
                     )
-                    if preparedImageFeatures != nil {
-                        emitVLMDiagnostic(
-                            "vlm_prepared_hit_append_fallback reason=\(reason)"
-                        )
-                        emitVLMDiagnostic(
-                            "vlm_cmlx_session_preserve reason=prepared_image_features_append_plan_failed"
-                        )
-                    } else {
-                        releaseNativeVLMCmlxSession(
-                            container: container,
-                            reason: "scheme_d_append_plan_failed"
-                        )
-                        promptCache.clear()
-                    }
+                } else if preparedImageFeatures != nil {
+                    emitVLMDiagnostic(
+                        "vlm_cmlx_session_preserve reason=prepared_image_features"
+                    )
+                } else {
+                    releaseNativeVLMCmlxSession(
+                        container: container,
+                        reason: "media_generate_before_vision_load"
+                    )
+                    promptCache.clear()
                 }
-            } else if NativeEnvironment.bool("EDGE_VLM_PRESERVE_DECODER_FOR_VISION_EXPERIMENT") {
-                emitVLMDiagnostic(
-                    "vlm_cmlx_session_preserve reason=media_generate_before_vision_load_experiment"
-                )
-            } else if preparedImageFeatures != nil {
-                emitVLMDiagnostic(
-                    "vlm_cmlx_session_preserve reason=prepared_image_features"
-                )
-            } else {
-                releaseNativeVLMCmlxSession(
-                    container: container,
-                    reason: "media_generate_before_vision_load"
-                )
-                promptCache.clear()
             }
         }
-
         if preparedImageFeatures == nil {
             guard let preprocessedImages else {
                 throw EdgeRuntimeError.loadFailed("Native VLM image preprocessing result missing")
@@ -2391,12 +2638,13 @@ public final class VLMEngine: ObservableObject {
         }
 
         try applyNativeVLMCmlxCommandBufferLimits(
-            contextLengthHint: (appendPlan?.cachedTokensReused ?? 0) +
+            contextLengthHint: neuralImprintPrefixTokenCount +
+                (appendPlan?.cachedTokensReused ?? 0) +
                 (appendPlan?.suffixTokenIds.count ?? promptTokens.count) +
                 parameters.maxTokens
         )
         emitVLMDiagnostic(
-            "vlm_cmlx_media_policy prompt=\(promptTokens.count) maxTokens=\(parameters.maxTokens) kvCapacity=\(kvCapacity) limit=\(attentionCacheLimit) useDSR=\(parameters.useDSR) dsrMax=\(parameters.dsrMaxCritical.map(String.init) ?? "nil") prefill=\(parameters.prefillStepSize) policy=\(resolved.reasoning)"
+            "vlm_cmlx_media_policy prompt=\(promptTokens.count) neuralImprintPrefix=\(neuralImprintPrefixTokenCount) maxTokens=\(parameters.maxTokens) kvCapacity=\(kvCapacity) limit=\(attentionCacheLimit) useDSR=\(parameters.useDSR) dsrMax=\(parameters.dsrMaxCritical.map(String.init) ?? "nil") prefill=\(parameters.prefillStepSize) policy=\(resolved.reasoning + policyReasonSuffix)"
         )
         try prepareNativeVLMCmlxSession(
             container: container,
@@ -2408,7 +2656,22 @@ public final class VLMEngine: ObservableObject {
         let prefillTokenIds: [Int]
         let promptCacheHit: Bool
         let cachedTokensReused: Int
-        if let appendPlan {
+        if let neuralImprintStatus {
+            try container.restoreCmlxNeuralImprintCache(
+                artifactURL: neuralImprintStatus.artifactURL,
+                prefixTokenCount: neuralImprintStatus.prefixTokenCount
+            )
+            nativeVLMCmlxTokenIds = []
+            nativeVLMCmlxPromptMessages = []
+            nativeVLMCmlxLastAssistantText = ""
+            nativeVLMCmlxContainsMediaContext = false
+            prefillTokenIds = promptTokens
+            promptCacheHit = false
+            cachedTokensReused = 0
+            emitVLMDiagnostic(
+                "vlm_cmlx_neural_imprint_restore prefix=\(neuralImprintStatus.prefixTokenCount) artifactSHA256=\(neuralImprintStatus.artifactSHA256)"
+            )
+        } else if let appendPlan {
             prefillTokenIds = appendPlan.suffixTokenIds
             promptCacheHit = true
             cachedTokensReused = appendPlan.cachedTokensReused
@@ -2441,6 +2704,9 @@ public final class VLMEngine: ObservableObject {
         emitVLMDiagnostic(
             "vlm_cmlx_media_first_token_ready tokenAvailable=\(nextTokenID != nil)"
         )
+        let residentPromptTokenCountAfterPrefill = (appendPlan != nil)
+            ? nativeVLMCmlxTokenIds.count + prefillTokenIds.count
+            : prefillTokenIds.count
         let firstTokenAt = Date()
         var generatedTokenIds: [Int] = []
         generatedTokenIds.reserveCapacity(parameters.maxTokens)
@@ -2473,6 +2739,11 @@ public final class VLMEngine: ObservableObject {
                 )
             }
 
+            try applyNativeVLMCmlxCommandBufferLimits(
+                contextLengthHint: neuralImprintPrefixTokenCount +
+                    residentPromptTokenCountAfterPrefill +
+                    generatedTokenIds.count
+            )
             nextTokenID = try container.decodeCmlxStep(tokenID: tokenID)
         }
 
@@ -2490,7 +2761,7 @@ public final class VLMEngine: ObservableObject {
         nativeVLMCmlxLastAssistantText = NativePromptSessionReuse.normalizeAssistantText(emittedText)
         nativeVLMCmlxContainsMediaContext = true
         emitVLMDiagnostic(
-            "vlm_cmlx_media_session_seeded prompt=\(promptTokens.count) prefill=\(prefillTokenIds.count) generated=\(generatedTokenIds.count) total=\(nativeVLMCmlxTokenIds.count) append=\(appendPlan != nil)"
+            "vlm_cmlx_media_session_seeded prompt=\(promptTokens.count) prefill=\(prefillTokenIds.count) generated=\(generatedTokenIds.count) total=\(nativeVLMCmlxTokenIds.count) append=\(appendPlan != nil) neuralImprintPrefix=\(neuralImprintPrefixTokenCount)"
         )
         promptCache.update(
             cache: [],
@@ -2505,7 +2776,7 @@ public final class VLMEngine: ObservableObject {
             generationTokenCount: generatedTokenIds.count,
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
-            policyReasoning: resolved.reasoning + " | nativeVLMImageCmlx=on",
+            policyReasoning: resolved.reasoning + policyReasonSuffix + " | nativeVLMImageCmlx=on",
             promptCacheHit: promptCacheHit,
             cachedTokensReused: cachedTokensReused,
             thermalState: ThermalManager().level.rawValue,
