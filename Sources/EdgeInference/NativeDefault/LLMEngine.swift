@@ -479,7 +479,10 @@ public final class LLMEngine: ObservableObject {
             if nativeUseCmlxLazyDecode {
                 nativeExecutor = nil
                 nativeModel = nil
-                diagnosticSink?("cmlx_lazy_load_local deferred_swift_model=true")
+                try prewarmNativeCmlxLazySession(
+                    bundleIndex: bundleIndex,
+                    runtime: runtime
+                )
             } else {
                 let loaded = try loadNativeModelFallback(runtime: runtime, bundleIndex: bundleIndex)
                 nativeExecutor = loaded.executor
@@ -1703,6 +1706,86 @@ public final class LLMEngine: ObservableObject {
         nativeCmlxLazyDecodeSessionAttentionCacheQuantization = nil
         nativeCmlxLazyDecodeSessionFrogJumpLayerMask = 0
         nativeCmlxLimitState.reset()
+    }
+
+    private func prewarmNativeCmlxLazySession(
+        bundleIndex: QwenModelBundleIndex,
+        runtime: EdgeMetalRuntime
+    ) throws {
+        releaseNativeCmlxLazySession(reason: "load_local_prewarm")
+
+        var parameters = EdgeGenerateParameters.default
+        let arch = archInfo ?? ModelArchInfo.fallback(
+            modelSizeGB: Self.estimateModelSizeGB(
+                directory: modelDirectory ?? bundleIndex.rootURL
+            )
+        )
+        let snapshot = InferencePolicy.DeviceSnapshot.capture()
+        let resolved = InferencePolicy.resolve(
+            snapshot: snapshot,
+            context: InferencePolicy.TurnContext(
+                turn: 1,
+                cachedTokenCount: 0,
+                archInfo: arch,
+                scene: parameters.dsrScene,
+                requestedMaxTokens: parameters.maxTokens,
+                planPrefillStepSize: currentPlan?.prefillStepSize,
+                memoryIntent: currentPlan?.memoryIntent ?? memoryPolicy?.memoryIntent ?? .balanced
+            ),
+            staticPolicy: memoryPolicy,
+            dsrMaxCriticalOverride: parameters.dsrMaxCritical
+        )
+        resolved.apply(to: &parameters)
+        if let evictOverride = Self.dsrEvictionIntervalEnvironmentOverride(),
+           parameters.useDSR {
+            parameters.dsrEvictionInterval = evictOverride
+        }
+        if let kvBitsOverride = Self.kvBitsEnvironmentOverride() {
+            parameters.kvBits = kvBitsOverride > 0 ? kvBitsOverride : 0
+        }
+
+        let dsrPolicies = try Self.makeDSRPolicies(
+            parameters: parameters,
+            architecture: bundleIndex.architecture
+        )
+        let attentionCacheQuantization = Self.cmlxAttentionCacheQuantization(
+            parameters: parameters,
+            dsrPolicies: dsrPolicies
+        )
+        let requestedFrogJumpPlan = QwenFrogJumpPlan.compute(
+            architecture: bundleIndex.architecture,
+            requestedEnabled: parameters.frogJumpEnabled,
+            thinkingEnabled: parameters.enableThinking
+        )
+        let requestedFrogJumpLayers = requestedFrogJumpPlan.enabled &&
+            requestedFrogJumpPlan.skipLayers.contains(12) &&
+            requestedFrogJumpPlan.skipLayers.contains(13)
+            ? [12, 13]
+            : []
+        let requestedFrogJumpMask = requestedFrogJumpLayers.reduce(UInt64.zero) { mask, layer in
+            mask | (UInt64(1) << UInt64(layer))
+        }
+        let attentionCacheLimit = parameters.maxKVSize ?? parameters.dsrMaxCritical
+        diagnosticSink?(
+            "cmlx_lazy_load_prewarm_begin dsrPolicy=\(Self.dsrPolicySummary(dsrPolicies)) attentionKV=\(Self.cmlxAttentionCacheQuantizationSummary(attentionCacheQuantization)) attentionLimit=\(attentionCacheLimit.map(String.init) ?? "nil") frogJump=0x\(String(requestedFrogJumpMask, radix: 16))"
+        )
+        let created = try QwenCmlxLazyDecodeSession(
+            bundleIndex: bundleIndex,
+            runtime: runtime,
+            attentionCacheLimit: attentionCacheLimit,
+            dsrPolicies: dsrPolicies,
+            attentionCacheQuantizationGroupSize: attentionCacheQuantization?.groupSize,
+            attentionCacheQuantizationBits: attentionCacheQuantization?.bits,
+            frogJumpLayerMask: requestedFrogJumpMask
+        )
+        nativeCmlxLazyDecodeSession = created
+        nativeCmlxLazyDecodeSessionDSRPolicies = dsrPolicies
+        nativeCmlxLazyDecodeSessionAttentionCacheQuantization = attentionCacheQuantization
+        nativeCmlxLazyDecodeSessionFrogJumpLayerMask = requestedFrogJumpMask
+        let memorySummary = (try? created.memorySummary()) ?? "unavailable"
+        diagnosticSink?(
+            "cmlx_lazy_load_prewarm_done floats=\(created.registeredFloatTensorCount) quantized=\(created.registeredQuantizedTensorCount) memory={\(memorySummary)}"
+        )
     }
 
     private func loadNativeModelFallback(
