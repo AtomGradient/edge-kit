@@ -35,6 +35,42 @@ extension VLMImagePolicy: CustomStringConvertible {
     }
 }
 
+private actor VLMNativeOperationSerializer {
+    private var isRunning = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func run<T>(_ operation: () async throws -> T) async throws -> T {
+        await enter()
+        do {
+            try Task.checkCancellation()
+            let result = try await operation()
+            leave()
+            return result
+        } catch {
+            leave()
+            throw error
+        }
+    }
+
+    private func enter() async {
+        if !isRunning {
+            isRunning = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func leave() {
+        if waiters.isEmpty {
+            isRunning = false
+            return
+        }
+        waiters.removeFirst().resume()
+    }
+}
+
 public final class VLMEngine: ObservableObject {
     @Published public private(set) var state: EngineState = .idle
     @Published public private(set) var downloadProgress: Double = 0
@@ -50,6 +86,7 @@ public final class VLMEngine: ObservableObject {
 
     private var modelDirectory: URL?
     private var nativeContainer: QwenVLMNativeContainer?
+    private let nativeOperationSerializer = VLMNativeOperationSerializer()
     private var nativeTokenizer: Tokenizer?
     private var nativeEndTokenIds: Set<Int> = []
     private var turnCounter = 0
@@ -538,6 +575,18 @@ public final class VLMEngine: ObservableObject {
     public func preloadImageFeatures(
         image: URL,
         imagePolicy: VLMImagePolicy? = nil
+    ) async throws -> Int {
+        try await nativeOperationSerializer.run {
+            try await preloadImageFeaturesLocked(
+                image: image,
+                imagePolicy: imagePolicy
+            )
+        }
+    }
+
+    private func preloadImageFeaturesLocked(
+        image: URL,
+        imagePolicy: VLMImagePolicy?
     ) async throws -> Int {
         guard state == .ready else {
             throw EdgeRuntimeError.loadFailed("VLM image preload requires a ready model")
@@ -1243,12 +1292,14 @@ public final class VLMEngine: ObservableObject {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
                 do {
-                    try await self.runNativeTextGenerate(
-                        messages: messages,
-                        tools: tools,
-                        requestedParameters: parameters,
-                        continuation: continuation
-                    )
+                    try await self.nativeOperationSerializer.run {
+                        try await self.runNativeTextGenerate(
+                            messages: messages,
+                            tools: tools,
+                            requestedParameters: parameters,
+                            continuation: continuation
+                        )
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -2010,14 +2061,16 @@ public final class VLMEngine: ObservableObject {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
                 do {
-                    try await self.runNativeImageGenerate(
-                        messages: messages,
-                        inputs: inputs,
-                        tools: tools,
-                        imagePolicy: imagePolicy,
-                        requestedParameters: parameters,
-                        continuation: continuation
-                    )
+                    try await self.nativeOperationSerializer.run {
+                        try await self.runNativeImageGenerate(
+                            messages: messages,
+                            inputs: inputs,
+                            tools: tools,
+                            imagePolicy: imagePolicy,
+                            requestedParameters: parameters,
+                            continuation: continuation
+                        )
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
