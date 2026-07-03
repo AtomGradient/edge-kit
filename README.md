@@ -80,7 +80,7 @@ case .tts: try await engine.tts!.speak("Hello", voice: "serena")
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/AtomGradient/edge-kit.git", exact: "1.0.0-rc98")
+    .package(url: "https://github.com/AtomGradient/edge-kit.git", exact: "1.0.0-rc103")
 ]
 ```
 

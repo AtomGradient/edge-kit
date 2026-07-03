@@ -5,7 +5,7 @@ Exact versions and revisions are recorded in `Package.resolved`.
 
 `edge-engine` is a first-party AtomGradient dependency and is governed by its
 own MIT license. The current version contract points to the MIT-clean
-`edge-engine` tag `1.0.0-rc138`.
+`edge-engine` tag `1.0.0-rc143`.
 
 ## SwiftPM Dependencies
 
