@@ -86,13 +86,6 @@ public struct InferenceMetrics: Sendable {
     /// Prompt token count (prefill phase)
     public let promptTokenCount: Int
 
-    /// SHA-256 of the exact prompt token IDs submitted to this generation.
-    ///
-    /// The digest uses the same canonical `[1,2,3]` representation as Neural
-    /// Imprint artifact metadata. It lets evaluation harnesses verify prompt
-    /// identity without persisting reversible token IDs.
-    public let promptTokenIDsSHA256: String?
-
     /// Generated token count (decode phase)
     public let generationTokenCount: Int
 
@@ -126,7 +119,6 @@ public struct InferenceMetrics: Sendable {
         deferredLoadMs: Double?,
         phaseTimings: InferencePhaseTimings? = nil,
         promptTokenCount: Int,
-        promptTokenIDsSHA256: String? = nil,
         generationTokenCount: Int,
         memoryBeforeMB: Int,
         memoryAfterMB: Int,
@@ -141,7 +133,6 @@ public struct InferenceMetrics: Sendable {
         self.deferredLoadMs = deferredLoadMs
         self.phaseTimings = phaseTimings
         self.promptTokenCount = promptTokenCount
-        self.promptTokenIDsSHA256 = promptTokenIDsSHA256
         self.generationTokenCount = generationTokenCount
         self.memoryBeforeMB = memoryBeforeMB
         self.memoryAfterMB = memoryAfterMB

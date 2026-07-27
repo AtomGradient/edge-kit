@@ -696,33 +696,6 @@ public final class VLMEngine: ObservableObject {
         )
     }
 
-    /// Renders the exact text prompt token IDs used by text generation.
-    ///
-    /// Evaluation code should persist only a digest/count because token IDs are
-    /// reversible.
-    public func renderPromptTokenIDs(
-        messages: [ChatMessage],
-        tools: [ToolSpec]? = nil,
-        parameters: EdgeGenerateParameters = .default
-    ) async throws -> [Int] {
-        guard state == .ready else {
-            throw EdgeRuntimeError.loadFailed("No VLM model loaded")
-        }
-        guard let tokenizer = nativeTokenizer else {
-            throw EdgeRuntimeError.loadFailed("Native VLM tokenizer is not initialized")
-        }
-        let promptMessages = messages.promptCacheMessages(
-            preserveThinking: parameters.preserveThinking
-        )
-        return try NeuralImprintRuntimeSupport.renderPromptTokenIDs(
-            promptMessages: promptMessages,
-            tools: tools,
-            parameters: parameters,
-            tokenizer: tokenizer,
-            additionalContext: LLMEngine.chatTemplateContext(parameters:)
-        )
-    }
-
     @discardableResult
     public func restoreNeuralImprintCache(from directory: URL) throws -> NeuralImprintCacheStatus {
         guard state == .ready else {
@@ -1544,12 +1517,12 @@ public final class VLMEngine: ObservableObject {
         let promptMessages = messages.promptCacheMessages(
             preserveThinking: parameters.preserveThinking
         )
-        let promptTokens = try NeuralImprintRuntimeSupport.renderPromptTokenIDs(
-            promptMessages: promptMessages,
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: promptMessages.chatTemplateMessages(
+                preserveThinking: parameters.preserveThinking
+            ),
             tools: promptTools,
-            parameters: parameters,
-            tokenizer: tokenizer,
-            additionalContext: LLMEngine.chatTemplateContext(parameters:)
+            additionalContext: LLMEngine.chatTemplateContext(parameters: parameters)
         )
         let architecture = container.index.languageIndex.architecture
         let arch = archInfo ?? ModelArchInfo.fallback(
@@ -1748,7 +1721,6 @@ public final class VLMEngine: ObservableObject {
             decodeTPS: Double(generatedTokenIds.count) / decodeSeconds,
             deferredLoadMs: deferredLoadMs,
             promptTokenCount: promptTokens.count,
-            promptTokenIDsSHA256: LLMEngine.neuralImprintTokenIDsSHA256(promptTokens),
             generationTokenCount: generatedTokenIds.count,
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
@@ -2147,7 +2119,6 @@ public final class VLMEngine: ObservableObject {
             decodeTPS: Double(generatedTokenIds.count) / decodeSeconds,
             deferredLoadMs: nil,
             promptTokenCount: promptTokenCountAfterPrefill,
-            promptTokenIDsSHA256: LLMEngine.neuralImprintTokenIDsSHA256(promptTokens),
             generationTokenCount: generatedTokenIds.count,
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
@@ -2802,7 +2773,6 @@ public final class VLMEngine: ObservableObject {
             decodeTPS: Double(generatedTokenIds.count) / decodeSeconds,
             deferredLoadMs: nil,
             promptTokenCount: promptTokens.count,
-            promptTokenIDsSHA256: LLMEngine.neuralImprintTokenIDsSHA256(promptTokens),
             generationTokenCount: generatedTokenIds.count,
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,

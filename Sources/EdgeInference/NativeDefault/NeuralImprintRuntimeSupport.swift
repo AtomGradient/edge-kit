@@ -109,22 +109,6 @@ enum NeuralImprintRuntimeSupport {
         )
     }
 
-    static func renderPromptTokenIDs(
-        promptMessages: [ChatMessage],
-        tools: [ToolSpec]?,
-        parameters: EdgeGenerateParameters,
-        tokenizer: Tokenizer,
-        additionalContext: (EdgeGenerateParameters) -> [String: any Sendable]
-    ) throws -> [Int] {
-        try tokenizer.applyChatTemplate(
-            messages: promptMessages.chatTemplateMessages(
-                preserveThinking: parameters.preserveThinking
-            ),
-            tools: tools,
-            additionalContext: additionalContext(parameters)
-        )
-    }
-
     static func loadCacheStatus(
         directory: URL,
         modelDirectory: URL,
@@ -176,11 +160,12 @@ enum NeuralImprintRuntimeSupport {
         }
 
         let lastStartIndex = fullTokenIDs.count - markerTokenIDs.count
-        let matches = (0...lastStartIndex).filter { index in
-            Array(fullTokenIDs[index..<index + markerTokenIDs.count]) == markerTokenIDs
+        for index in 0...lastStartIndex {
+            if Array(fullTokenIDs[index..<index + markerTokenIDs.count]) == markerTokenIDs {
+                return index
+            }
         }
-        guard matches.count == 1 else { return nil }
-        return matches[0]
+        return nil
     }
 
     static func neuralImprintCompatibleParameters(

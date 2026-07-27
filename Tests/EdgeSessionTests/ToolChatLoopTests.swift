@@ -88,7 +88,6 @@ final class ToolChatLoopTests: XCTestCase {
         ])
         let session = ChatSessionController(client: client)
         var roundContinueCount = 0
-        var observedMetricRounds: [Int] = []
 
         let reply = try await ToolChatLoop.run(
             session: session,
@@ -110,17 +109,13 @@ final class ToolChatLoopTests: XCTestCase {
                     return "tool result"
                 },
                 summarizeToolResults: { _ in "" },
-                onRoundWillContinue: { _ in roundContinueCount += 1 },
-                onRoundMetrics: { roundIndex, _ in
-                    observedMetricRounds.append(roundIndex)
-                }
+                onRoundWillContinue: { _ in roundContinueCount += 1 }
             ),
             onChunk: { _ in }
         )
 
         XCTAssertEqual(reply, "final answer")
         XCTAssertEqual(roundContinueCount, 1)
-        XCTAssertEqual(observedMetricRounds, [0, 1])
         XCTAssertEqual(client.generateCallCount, 2)
         XCTAssertEqual(
             client.messagesByRound[1].map(\.content),

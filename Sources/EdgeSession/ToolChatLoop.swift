@@ -87,7 +87,6 @@ public enum ToolChatLoop {
         public var onToolSummary: (String, [ToolResult]) async -> Void
         public var onPlannedToolSummaryEmpty: (PlannedToolCall, ToolResult) async -> Void
         public var onRoundWillContinue: ([ToolResult]) async -> Void
-        public var onRoundMetrics: (Int, InferenceMetrics?) async -> Void
         public var disallowedToolResult: (String) -> String
         public var toolExecutionErrorResult: (String, Error) -> String
 
@@ -105,7 +104,6 @@ public enum ToolChatLoop {
             onToolSummary: @escaping (String, [ToolResult]) async -> Void = { _, _ in },
             onPlannedToolSummaryEmpty: @escaping (PlannedToolCall, ToolResult) async -> Void = { _, _ in },
             onRoundWillContinue: @escaping ([ToolResult]) async -> Void = { _ in },
-            onRoundMetrics: @escaping (Int, InferenceMetrics?) async -> Void = { _, _ in },
             disallowedToolResult: @escaping (String) -> String = ToolChatLoop.defaultDisallowedToolResult,
             toolExecutionErrorResult: @escaping (String, Error) -> String = ToolChatLoop.defaultToolExecutionErrorResult
         ) {
@@ -122,7 +120,6 @@ public enum ToolChatLoop {
             self.onToolSummary = onToolSummary
             self.onPlannedToolSummaryEmpty = onPlannedToolSummaryEmpty
             self.onRoundWillContinue = onRoundWillContinue
-            self.onRoundMetrics = onRoundMetrics
             self.disallowedToolResult = disallowedToolResult
             self.toolExecutionErrorResult = toolExecutionErrorResult
         }
@@ -171,7 +168,7 @@ public enum ToolChatLoop {
             await hooks.onPlannedToolSummaryEmpty(planned, result)
         }
 
-        for roundIndex in 0..<request.maxRounds {
+        for _ in 0..<request.maxRounds {
             var roundText = ""
             let roundState = ToolChatRoundState()
 
@@ -214,7 +211,6 @@ public enum ToolChatLoop {
                     onChunk(chunk)
                 }
             )
-            await hooks.onRoundMetrics(roundIndex, session.lastMetrics)
 
             finalText = roundText.trimmingCharacters(in: .whitespacesAndNewlines)
             let toolCallsThisRound = roundState.toolResults()

@@ -429,12 +429,6 @@ final class LLMEngineTests: XCTestCase {
         )
         XCTAssertNil(
             LLMEngine.neuralImprintPrefixSplitIndex(
-                fullTokenIDs: [20, 21, 10, 20, 21],
-                markerTokenIDs: [20, 21]
-            )
-        )
-        XCTAssertNil(
-            LLMEngine.neuralImprintPrefixSplitIndex(
                 fullTokenIDs: [10, 20, 30],
                 markerTokenIDs: []
             )
