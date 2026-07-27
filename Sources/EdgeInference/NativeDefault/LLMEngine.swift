@@ -481,6 +481,33 @@ public final class LLMEngine: ObservableObject {
         )
     }
 
+    /// Renders the exact text prompt token IDs used by `generate`.
+    ///
+    /// This is intended for local evaluation and compatibility checks. Callers
+    /// should persist only a digest/count because token IDs are reversible.
+    public func renderPromptTokenIDs(
+        messages: [ChatMessage],
+        tools: [ToolSpec]? = nil,
+        parameters: EdgeGenerateParameters = .default
+    ) async throws -> [Int] {
+        guard state == .ready else {
+            throw EdgeRuntimeError.loadFailed("No LLM model loaded")
+        }
+        guard let tokenizer = nativeTokenizer else {
+            throw EdgeRuntimeError.loadFailed("Native Qwen tokenizer is not initialized")
+        }
+        let promptMessages = messages.promptCacheMessages(
+            preserveThinking: parameters.preserveThinking
+        )
+        return try NeuralImprintRuntimeSupport.renderPromptTokenIDs(
+            promptMessages: promptMessages,
+            tools: tools,
+            parameters: parameters,
+            tokenizer: tokenizer,
+            additionalContext: Self.chatTemplateContext(parameters:)
+        )
+    }
+
     public func captureHiddenStates(
         tokens: [Int],
         targetLayer: Int
@@ -1154,12 +1181,12 @@ public final class LLMEngine: ObservableObject {
         let promptMessages = messages.promptCacheMessages(
             preserveThinking: parameters.preserveThinking
         )
-        let promptTokens = try tokenizer.applyChatTemplate(
-            messages: promptMessages.chatTemplateMessages(
-                preserveThinking: parameters.preserveThinking
-            ),
+        let promptTokens = try NeuralImprintRuntimeSupport.renderPromptTokenIDs(
+            promptMessages: promptMessages,
             tools: promptTools,
-            additionalContext: Self.chatTemplateContext(parameters: parameters)
+            parameters: parameters,
+            tokenizer: tokenizer,
+            additionalContext: Self.chatTemplateContext(parameters:)
         )
         let inputPreparedAt = Date()
         let arch = archInfo ?? ModelArchInfo.fallback(
@@ -1441,6 +1468,7 @@ public final class LLMEngine: ObservableObject {
                 decodeMs: endedAt.timeIntervalSince(first) * 1000
             ),
             promptTokenCount: promptTokens.count,
+            promptTokenIDsSHA256: Self.neuralImprintTokenIDsSHA256(promptTokens),
             generationTokenCount: generatedTokenIds.count,
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
@@ -2060,6 +2088,7 @@ public final class LLMEngine: ObservableObject {
                 prefillMode: prefillMode
             ),
             promptTokenCount: promptTokens.count,
+            promptTokenIDsSHA256: Self.neuralImprintTokenIDsSHA256(promptTokens),
             generationTokenCount: generatedTokenIds.count,
             memoryBeforeMB: memoryBefore,
             memoryAfterMB: memoryAfter,
