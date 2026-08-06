@@ -45,6 +45,39 @@ public struct NeuralImprintGreedyPathComparison: Codable, Sendable, Equatable {
     public let visibleRestoredFirstTokenDifference: Int?
 }
 
+public struct NeuralImprintForcedTokenPathReceipt: Codable, Sendable, Equatable {
+    public let mode: String
+    public let stateSource: String
+    public let interventionTokenSource: String
+    public let interventionIndex: Int
+    public let interventionTokenID: Int
+    public let generatedTokenCount: Int
+    public let postInterventionTokenCount: Int
+    public let tokenIDsSHA256: String
+    public let postInterventionTokenIDsSHA256: String
+    public let textSHA256: String
+}
+
+public struct NeuralImprintForcedTokenPairComparison: Codable, Sendable, Equatable {
+    public let comparisonKind: String
+    public let leftMode: String
+    public let rightMode: String
+    public let postInterventionTokenIDsEqual: Bool
+    public let postInterventionFirstTokenDifference: Int?
+    public let postInterventionEditDistance: Int
+    public let postInterventionNormalizedEditDistance: Double
+}
+
+public struct NeuralImprintForcedTokenCrossoverResult: Codable, Sendable, Equatable {
+    public let schemaVersion: String
+    public let interventionIndex: Int
+    public let visibleTokenID: Int
+    public let liveCacheTokenID: Int
+    public let naturalReplayMatchesBaselineByState: [String: Bool]
+    public let paths: [NeuralImprintForcedTokenPathReceipt]
+    public let pairComparisons: [NeuralImprintForcedTokenPairComparison]
+}
+
 public struct NeuralImprintGreedyEquivalenceResult: Codable, Sendable, Equatable {
     public let schemaVersion: String
     public let prefixTokenCount: Int
@@ -58,15 +91,23 @@ public struct NeuralImprintGreedyEquivalenceResult: Codable, Sendable, Equatable
     public let paths: [NeuralImprintGreedyPathReceipt]
     public let comparison: NeuralImprintGreedyPathComparison
     public let divergenceProbes: [NeuralImprintGreedyDivergenceProbe]
+    public let forcedTokenCrossover: NeuralImprintForcedTokenCrossoverResult?
 }
 
 enum NeuralImprintGreedyEquivalenceSupport {
-    static let schemaVersion = "edge-kit.neural_imprint_greedy_equivalence.v1"
+    static let schemaVersion = "edge-kit.neural_imprint_greedy_equivalence.v2"
+    static let crossoverSchemaVersion =
+        "edge-kit.neural_imprint_forced_token_crossover.v1"
 
     private struct GeneratedPath {
         let receipt: NeuralImprintGreedyPathReceipt
         let tokenIDs: [Int]
         let sampleDiagnostics: [String]
+    }
+
+    private struct ForcedGeneratedPath {
+        let receipt: NeuralImprintForcedTokenPathReceipt
+        let tokenIDs: [Int]
     }
 
     static func run(
@@ -157,6 +198,23 @@ enum NeuralImprintGreedyEquivalenceSupport {
             comparison.liveRestoredFirstTokenDifference,
             comparison.visibleRestoredFirstTokenDifference,
         ].compactMap { $0 }).sorted()
+        let crossoverResult = try comparison.visibleLiveFirstTokenDifference.flatMap {
+            try forcedTokenCrossover(
+                interventionIndex: $0,
+                session: session,
+                tokenizer: tokenizer,
+                prefixTokenIDs: prefixTokenIDs,
+                suffixTokenIDs: suffixTokenIDs,
+                visibleTokenIDs: visibleTokenIDs,
+                visibleNaturalTokenIDs: visible.tokenIDs,
+                liveNaturalTokenIDs: live.tokenIDs,
+                maxTokens: maxTokens,
+                endTokenIDs: endTokenIDs,
+                visiblePrefillStep: visiblePrefillStep,
+                capturePrefillStep: capturePrefillStep,
+                captureUsesSyncPrefill: captureUsesSyncPrefill
+            )
+        }
         return NeuralImprintGreedyEquivalenceResult(
             schemaVersion: schemaVersion,
             prefixTokenCount: prefixTokenIDs.count,
@@ -177,7 +235,171 @@ enum NeuralImprintGreedyEquivalenceSupport {
                     index: index,
                     paths: [visible, live, restored]
                 )
-            }
+            },
+            forcedTokenCrossover: crossoverResult
+        )
+    }
+
+    private static func forcedTokenCrossover(
+        interventionIndex: Int,
+        session: QwenCmlxLazyDecodeSession,
+        tokenizer: Tokenizer,
+        prefixTokenIDs: [Int],
+        suffixTokenIDs: [Int],
+        visibleTokenIDs: [Int],
+        visibleNaturalTokenIDs: [Int],
+        liveNaturalTokenIDs: [Int],
+        maxTokens: Int,
+        endTokenIDs: Set<Int>,
+        visiblePrefillStep: Int,
+        capturePrefillStep: Int,
+        captureUsesSyncPrefill: Bool
+    ) throws -> NeuralImprintForcedTokenCrossoverResult? {
+        guard interventionIndex > 0,
+              visibleNaturalTokenIDs.indices.contains(interventionIndex),
+              liveNaturalTokenIDs.indices.contains(interventionIndex)
+        else {
+            return nil
+        }
+        let visibleTokenID = visibleNaturalTokenIDs[interventionIndex]
+        let liveTokenID = liveNaturalTokenIDs[interventionIndex]
+        guard visibleTokenID != liveTokenID else { return nil }
+
+        let visibleVisible = try generateForcedCrossoverPath(
+            mode: "visible_state_visible_token",
+            stateSource: "visible_profile",
+            interventionTokenSource: "visible_profile",
+            interventionTokenID: visibleTokenID,
+            interventionIndex: interventionIndex,
+            session: session,
+            tokenizer: tokenizer,
+            prefixTokenIDs: prefixTokenIDs,
+            suffixTokenIDs: suffixTokenIDs,
+            visibleTokenIDs: visibleTokenIDs,
+            expectedNaturalTokenIDs: visibleNaturalTokenIDs,
+            maxTokens: maxTokens,
+            endTokenIDs: endTokenIDs,
+            visiblePrefillStep: visiblePrefillStep,
+            capturePrefillStep: capturePrefillStep,
+            captureUsesSyncPrefill: captureUsesSyncPrefill
+        )
+        let visibleLive = try generateForcedCrossoverPath(
+            mode: "visible_state_live_cache_token",
+            stateSource: "visible_profile",
+            interventionTokenSource: "live_cache",
+            interventionTokenID: liveTokenID,
+            interventionIndex: interventionIndex,
+            session: session,
+            tokenizer: tokenizer,
+            prefixTokenIDs: prefixTokenIDs,
+            suffixTokenIDs: suffixTokenIDs,
+            visibleTokenIDs: visibleTokenIDs,
+            expectedNaturalTokenIDs: visibleNaturalTokenIDs,
+            maxTokens: maxTokens,
+            endTokenIDs: endTokenIDs,
+            visiblePrefillStep: visiblePrefillStep,
+            capturePrefillStep: capturePrefillStep,
+            captureUsesSyncPrefill: captureUsesSyncPrefill
+        )
+        let liveLive = try generateForcedCrossoverPath(
+            mode: "live_cache_state_live_cache_token",
+            stateSource: "live_cache",
+            interventionTokenSource: "live_cache",
+            interventionTokenID: liveTokenID,
+            interventionIndex: interventionIndex,
+            session: session,
+            tokenizer: tokenizer,
+            prefixTokenIDs: prefixTokenIDs,
+            suffixTokenIDs: suffixTokenIDs,
+            visibleTokenIDs: visibleTokenIDs,
+            expectedNaturalTokenIDs: liveNaturalTokenIDs,
+            maxTokens: maxTokens,
+            endTokenIDs: endTokenIDs,
+            visiblePrefillStep: visiblePrefillStep,
+            capturePrefillStep: capturePrefillStep,
+            captureUsesSyncPrefill: captureUsesSyncPrefill
+        )
+        let liveVisible = try generateForcedCrossoverPath(
+            mode: "live_cache_state_visible_token",
+            stateSource: "live_cache",
+            interventionTokenSource: "visible_profile",
+            interventionTokenID: visibleTokenID,
+            interventionIndex: interventionIndex,
+            session: session,
+            tokenizer: tokenizer,
+            prefixTokenIDs: prefixTokenIDs,
+            suffixTokenIDs: suffixTokenIDs,
+            visibleTokenIDs: visibleTokenIDs,
+            expectedNaturalTokenIDs: liveNaturalTokenIDs,
+            maxTokens: maxTokens,
+            endTokenIDs: endTokenIDs,
+            visiblePrefillStep: visiblePrefillStep,
+            capturePrefillStep: capturePrefillStep,
+            captureUsesSyncPrefill: captureUsesSyncPrefill
+        )
+
+        let paths = [visibleVisible, visibleLive, liveLive, liveVisible]
+        let pairComparisons = [
+            compareCrossoverTokens(
+                comparisonKind: "natural_replay",
+                leftMode: "visible_profile_chat",
+                left: visibleNaturalTokenIDs,
+                rightMode: visibleVisible.receipt.mode,
+                right: visibleVisible.tokenIDs,
+                interventionIndex: interventionIndex
+            ),
+            compareCrossoverTokens(
+                comparisonKind: "natural_replay",
+                leftMode: "same_session_live_cache_chat",
+                left: liveNaturalTokenIDs,
+                rightMode: liveLive.receipt.mode,
+                right: liveLive.tokenIDs,
+                interventionIndex: interventionIndex
+            ),
+            compareCrossoverTokens(
+                comparisonKind: "same_state",
+                leftMode: visibleVisible.receipt.mode,
+                left: visibleVisible.tokenIDs,
+                rightMode: visibleLive.receipt.mode,
+                right: visibleLive.tokenIDs,
+                interventionIndex: interventionIndex
+            ),
+            compareCrossoverTokens(
+                comparisonKind: "same_state",
+                leftMode: liveLive.receipt.mode,
+                left: liveLive.tokenIDs,
+                rightMode: liveVisible.receipt.mode,
+                right: liveVisible.tokenIDs,
+                interventionIndex: interventionIndex
+            ),
+            compareCrossoverTokens(
+                comparisonKind: "same_token",
+                leftMode: visibleVisible.receipt.mode,
+                left: visibleVisible.tokenIDs,
+                rightMode: liveVisible.receipt.mode,
+                right: liveVisible.tokenIDs,
+                interventionIndex: interventionIndex
+            ),
+            compareCrossoverTokens(
+                comparisonKind: "same_token",
+                leftMode: visibleLive.receipt.mode,
+                left: visibleLive.tokenIDs,
+                rightMode: liveLive.receipt.mode,
+                right: liveLive.tokenIDs,
+                interventionIndex: interventionIndex
+            ),
+        ]
+        return NeuralImprintForcedTokenCrossoverResult(
+            schemaVersion: crossoverSchemaVersion,
+            interventionIndex: interventionIndex,
+            visibleTokenID: visibleTokenID,
+            liveCacheTokenID: liveTokenID,
+            naturalReplayMatchesBaselineByState: [
+                "visible_profile": visibleVisible.tokenIDs == visibleNaturalTokenIDs,
+                "live_cache": liveLive.tokenIDs == liveNaturalTokenIDs,
+            ],
+            paths: paths.map(\.receipt),
+            pairComparisons: pairComparisons
         )
     }
 
@@ -206,6 +428,161 @@ enum NeuralImprintGreedyEquivalenceSupport {
             return index
         }
         return left.count == right.count ? nil : min(left.count, right.count)
+    }
+
+    static func compareCrossoverTokens(
+        comparisonKind: String,
+        leftMode: String,
+        left: [Int],
+        rightMode: String,
+        right: [Int],
+        interventionIndex: Int
+    ) -> NeuralImprintForcedTokenPairComparison {
+        let firstPostInterventionIndex = max(0, interventionIndex + 1)
+        let leftPostIntervention = Array(
+            left.dropFirst(min(firstPostInterventionIndex, left.count))
+        )
+        let rightPostIntervention = Array(
+            right.dropFirst(min(firstPostInterventionIndex, right.count))
+        )
+        let distance = editDistance(leftPostIntervention, rightPostIntervention)
+        let denominator = max(
+            1,
+            max(leftPostIntervention.count, rightPostIntervention.count)
+        )
+        return NeuralImprintForcedTokenPairComparison(
+            comparisonKind: comparisonKind,
+            leftMode: leftMode,
+            rightMode: rightMode,
+            postInterventionTokenIDsEqual: leftPostIntervention == rightPostIntervention,
+            postInterventionFirstTokenDifference: firstDifference(
+                leftPostIntervention,
+                rightPostIntervention
+            ),
+            postInterventionEditDistance: distance,
+            postInterventionNormalizedEditDistance:
+                Double(distance) / Double(denominator)
+        )
+    }
+
+    static func editDistance(_ left: [Int], _ right: [Int]) -> Int {
+        guard !left.isEmpty else { return right.count }
+        guard !right.isEmpty else { return left.count }
+        var previous = Array(0...right.count)
+        var current = Array(repeating: 0, count: right.count + 1)
+        for (leftIndex, leftToken) in left.enumerated() {
+            current[0] = leftIndex + 1
+            for (rightIndex, rightToken) in right.enumerated() {
+                current[rightIndex + 1] = min(
+                    previous[rightIndex + 1] + 1,
+                    current[rightIndex] + 1,
+                    previous[rightIndex] + (leftToken == rightToken ? 0 : 1)
+                )
+            }
+            swap(&previous, &current)
+        }
+        return previous[right.count]
+    }
+
+    private static func generateForcedCrossoverPath(
+        mode: String,
+        stateSource: String,
+        interventionTokenSource: String,
+        interventionTokenID: Int,
+        interventionIndex: Int,
+        session: QwenCmlxLazyDecodeSession,
+        tokenizer: Tokenizer,
+        prefixTokenIDs: [Int],
+        suffixTokenIDs: [Int],
+        visibleTokenIDs: [Int],
+        expectedNaturalTokenIDs: [Int],
+        maxTokens: Int,
+        endTokenIDs: Set<Int>,
+        visiblePrefillStep: Int,
+        capturePrefillStep: Int,
+        captureUsesSyncPrefill: Bool
+    ) throws -> ForcedGeneratedPath {
+        try session.reset()
+        let inputTokenIDs: [Int]
+        switch stateSource {
+        case "visible_profile":
+            inputTokenIDs = visibleTokenIDs
+        case "live_cache":
+            try prefillCapturedPrefix(
+                session: session,
+                tokenIDs: prefixTokenIDs,
+                chunkSize: capturePrefillStep,
+                synchronous: captureUsesSyncPrefill
+            )
+            inputTokenIDs = suffixTokenIDs
+        default:
+            throw EdgeRuntimeError.loadFailed(
+                "Unknown forced-token crossover state source: \(stateSource)"
+            )
+        }
+
+        var naturalTokenID = try prefillForGreedyDecode(
+            session: session,
+            tokenIDs: inputTokenIDs,
+            chunkSize: visiblePrefillStep
+        )
+        var generatedTokenIDs: [Int] = []
+        generatedTokenIDs.reserveCapacity(maxTokens)
+        for index in 0..<interventionIndex {
+            guard expectedNaturalTokenIDs.indices.contains(index),
+                  naturalTokenID == expectedNaturalTokenIDs[index]
+            else {
+                throw EdgeRuntimeError.loadFailed(
+                    "Forced-token crossover natural-prefix replay mismatch at index \(index)"
+                )
+            }
+            generatedTokenIDs.append(naturalTokenID)
+            if index + 1 < interventionIndex {
+                naturalTokenID = try session.nextToken()
+            }
+        }
+
+        generatedTokenIDs.append(interventionTokenID)
+        if generatedTokenIDs.count < maxTokens,
+           !endTokenIDs.contains(interventionTokenID) {
+            // The state has consumed token interventionIndex - 1 and holds the
+            // natural token at interventionIndex as pending. Advancing with the
+            // selected intervention token replaces that pending choice while
+            // preserving the normal async decode schedule for the continuation.
+            try session.prefillAsync(tokenIDs: [interventionTokenID])
+            while generatedTokenIDs.count < maxTokens {
+                let tokenID = try session.nextToken()
+                guard !endTokenIDs.contains(tokenID) else { break }
+                generatedTokenIDs.append(tokenID)
+            }
+        }
+
+        let postInterventionTokenIDs = Array(
+            generatedTokenIDs.dropFirst(
+                min(interventionIndex + 1, generatedTokenIDs.count)
+            )
+        )
+        let decodedText = tokenizer.decode(
+            tokens: generatedTokenIDs,
+            skipSpecialTokens: true
+        )
+        return ForcedGeneratedPath(
+            receipt: NeuralImprintForcedTokenPathReceipt(
+                mode: mode,
+                stateSource: stateSource,
+                interventionTokenSource: interventionTokenSource,
+                interventionIndex: interventionIndex,
+                interventionTokenID: interventionTokenID,
+                generatedTokenCount: generatedTokenIDs.count,
+                postInterventionTokenCount: postInterventionTokenIDs.count,
+                tokenIDsSHA256: sha256JSON(generatedTokenIDs),
+                postInterventionTokenIDsSHA256: sha256JSON(
+                    postInterventionTokenIDs
+                ),
+                textSHA256: sha256Text(decodedText)
+            ),
+            tokenIDs: generatedTokenIDs
+        )
     }
 
     private static func divergenceProbe(

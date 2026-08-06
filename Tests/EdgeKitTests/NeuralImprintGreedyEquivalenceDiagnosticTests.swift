@@ -52,4 +52,58 @@ final class NeuralImprintGreedyEquivalenceDiagnosticTests: XCTestCase {
         XCTAssertEqual(comparison.visibleLiveFirstTokenDifference, 1)
         XCTAssertNil(comparison.liveRestoredFirstTokenDifference)
     }
+
+    func testForcedTokenComparisonUsesOnlyPostInterventionTokens() {
+        let comparison = NeuralImprintGreedyEquivalenceSupport.compareCrossoverTokens(
+            comparisonKind: "same_state",
+            leftMode: "visible_state_visible_token",
+            left: [10, 20, 30, 40, 50],
+            rightMode: "visible_state_live_cache_token",
+            right: [10, 20, 31, 40, 60],
+            interventionIndex: 2
+        )
+
+        XCTAssertFalse(comparison.postInterventionTokenIDsEqual)
+        XCTAssertEqual(comparison.postInterventionFirstTokenDifference, 1)
+        XCTAssertEqual(comparison.postInterventionEditDistance, 1)
+        XCTAssertEqual(comparison.postInterventionNormalizedEditDistance, 0.5)
+    }
+
+    func testForcedTokenEditDistanceSupportsInsertDeleteAndSubstitute() {
+        XCTAssertEqual(
+            NeuralImprintGreedyEquivalenceSupport.editDistance(
+                [1, 2, 3],
+                [1, 4, 3, 5]
+            ),
+            2
+        )
+        XCTAssertEqual(
+            NeuralImprintGreedyEquivalenceSupport.editDistance([], [1, 2]),
+            2
+        )
+    }
+
+    func testForcedTokenReceiptDoesNotExportRawGeneratedContent() throws {
+        let receipt = NeuralImprintForcedTokenPathReceipt(
+            mode: "visible_state_live_cache_token",
+            stateSource: "visible_profile",
+            interventionTokenSource: "live_cache",
+            interventionIndex: 12,
+            interventionTokenID: 100_937,
+            generatedTokenCount: 220,
+            postInterventionTokenCount: 207,
+            tokenIDsSHA256: "token-hash",
+            postInterventionTokenIDsSHA256: "post-token-hash",
+            textSHA256: "text-hash"
+        )
+
+        let data = try JSONEncoder().encode(receipt)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        XCTAssertNil(object["generatedTokenIDs"])
+        XCTAssertNil(object["text"])
+        XCTAssertEqual(object["interventionTokenID"] as? Int, 100_937)
+    }
 }
