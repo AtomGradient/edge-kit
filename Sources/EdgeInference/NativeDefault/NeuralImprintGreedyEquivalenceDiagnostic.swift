@@ -88,6 +88,7 @@ public struct NeuralImprintGreedyEquivalenceResult: Codable, Sendable, Equatable
     public let visiblePrefillStep: Int
     public let capturePrefillStep: Int
     public let captureUsesSyncPrefill: Bool
+    public let visiblePrefillSplitAtPrefixBoundary: Bool
     public let sampleDiagnosticsAvailable: Bool
     public let paths: [NeuralImprintGreedyPathReceipt]
     public let comparison: NeuralImprintGreedyPathComparison
@@ -96,7 +97,7 @@ public struct NeuralImprintGreedyEquivalenceResult: Codable, Sendable, Equatable
 }
 
 enum NeuralImprintGreedyEquivalenceSupport {
-    static let schemaVersion = "edge-kit.neural_imprint_greedy_equivalence.v3"
+    static let schemaVersion = "edge-kit.neural_imprint_greedy_equivalence.v4"
     static let crossoverSchemaVersion =
         "edge-kit.neural_imprint_forced_token_crossover.v1"
 
@@ -126,6 +127,7 @@ enum NeuralImprintGreedyEquivalenceSupport {
         capturePrefillStep: Int,
         captureUsesSyncPrefill: Bool,
         includeForcedTokenCrossover: Bool = true,
+        alignVisiblePrefixBoundary: Bool = false,
         outputTextSink: (([String: String]) -> Void)? = nil
     ) throws -> NeuralImprintGreedyEquivalenceResult {
         let session = try QwenCmlxLazyDecodeSession(
@@ -141,7 +143,9 @@ enum NeuralImprintGreedyEquivalenceSupport {
             inputTokenIDs: visibleTokenIDs,
             maxTokens: maxTokens,
             endTokenIDs: endTokenIDs,
-            prefillStep: visiblePrefillStep
+            prefillStep: visiblePrefillStep,
+            prefillSplitIndices:
+                alignVisiblePrefixBoundary ? [prefixTokenIDs.count] : []
         )
 
         try session.reset()
@@ -239,6 +243,7 @@ enum NeuralImprintGreedyEquivalenceSupport {
             visiblePrefillStep: visiblePrefillStep,
             capturePrefillStep: capturePrefillStep,
             captureUsesSyncPrefill: captureUsesSyncPrefill,
+            visiblePrefillSplitAtPrefixBoundary: alignVisiblePrefixBoundary,
             sampleDiagnosticsAvailable: [visible, live, restored].allSatisfy {
                 !$0.sampleDiagnostics.isEmpty && $0.sampleDiagnostics.allSatisfy { !$0.isEmpty }
             },
@@ -638,12 +643,14 @@ enum NeuralImprintGreedyEquivalenceSupport {
         inputTokenIDs: [Int],
         maxTokens: Int,
         endTokenIDs: Set<Int>,
-        prefillStep: Int
+        prefillStep: Int,
+        prefillSplitIndices: [Int] = []
     ) throws -> GeneratedPath {
         var nextTokenID = try prefillForGreedyDecode(
             session: session,
             tokenIDs: inputTokenIDs,
-            chunkSize: prefillStep
+            chunkSize: prefillStep,
+            splitIndices: prefillSplitIndices
         )
         var generatedTokenIDs: [Int] = []
         var sampleDiagnostics: [String] = []
@@ -711,16 +718,35 @@ enum NeuralImprintGreedyEquivalenceSupport {
     private static func prefillForGreedyDecode(
         session: QwenCmlxLazyDecodeSession,
         tokenIDs: [Int],
-        chunkSize: Int
+        chunkSize: Int,
+        splitIndices: [Int] = []
     ) throws -> Int {
-        let step = max(1, chunkSize)
-        var offset = 0
-        while offset < tokenIDs.count {
-            let end = min(offset + step, tokenIDs.count)
-            try session.prefillAsync(tokenIDs: Array(tokenIDs[offset..<end]))
-            offset = end
+        for range in prefillChunkRanges(
+            tokenCount: tokenIDs.count,
+            chunkSize: chunkSize,
+            splitIndices: splitIndices
+        ) {
+            try session.prefillAsync(tokenIDs: Array(tokenIDs[range]))
         }
         return try session.nextToken()
+    }
+
+    static func prefillChunkRanges(
+        tokenCount: Int,
+        chunkSize: Int,
+        splitIndices: [Int]
+    ) -> [Range<Int>] {
+        guard tokenCount > 0 else { return [] }
+        let step = max(1, chunkSize)
+        let boundaries = Array(
+            Set([0, tokenCount] + splitIndices.filter { $0 > 0 && $0 < tokenCount })
+        ).sorted()
+        return zip(boundaries, boundaries.dropFirst()).flatMap { pair in
+            let (start, segmentEnd) = pair
+            return stride(from: start, to: segmentEnd, by: step).map { offset in
+                offset..<min(offset + step, segmentEnd)
+            }
+        }
     }
 
     private static func sha256JSON(_ tokenIDs: [Int]) -> String {

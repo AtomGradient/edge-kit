@@ -493,6 +493,7 @@ public final class LLMEngine: ObservableObject {
         capturePrefillStepOverride: Int? = nil,
         captureUsesSyncPrefillOverride: Bool? = nil,
         includeForcedTokenCrossover: Bool = true,
+        alignVisiblePrefixBoundary: Bool = false,
         outputTextSink: (([String: String]) -> Void)? = nil
     ) async throws -> NeuralImprintGreedyEquivalenceResult {
         guard state == .ready else {
@@ -597,6 +598,7 @@ public final class LLMEngine: ObservableObject {
             capturePrefillStep: capturePrefillStep,
             captureUsesSyncPrefill: captureUsesSyncPrefill,
             includeForcedTokenCrossover: includeForcedTokenCrossover,
+            alignVisiblePrefixBoundary: alignVisiblePrefixBoundary,
             outputTextSink: outputTextSink
         )
     }

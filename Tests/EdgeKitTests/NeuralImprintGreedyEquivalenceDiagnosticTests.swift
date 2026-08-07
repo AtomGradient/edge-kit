@@ -124,4 +124,16 @@ final class NeuralImprintGreedyEquivalenceDiagnosticTests: XCTestCase {
             )
         )
     }
+
+    func testPrefillChunkRangesCanHonorTheNeuralImprintPrefixBoundary() {
+        let ranges = NeuralImprintGreedyEquivalenceSupport.prefillChunkRanges(
+            tokenCount: 2_057,
+            chunkSize: 256,
+            splitIndices: [2_039]
+        )
+
+        XCTAssertEqual(ranges.last, 2_039..<2_057)
+        XCTAssertEqual(ranges[ranges.count - 2], 1_792..<2_039)
+        XCTAssertFalse(ranges.contains { $0.contains(2_038) && $0.contains(2_039) })
+    }
 }
