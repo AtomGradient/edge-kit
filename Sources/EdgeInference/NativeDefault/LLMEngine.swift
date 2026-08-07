@@ -482,12 +482,18 @@ public final class LLMEngine: ObservableObject {
     }
 
     #if DEBUG
+    @MainActor
     public func runNeuralImprintGreedyEquivalenceDiagnostic(
         profileBody: String,
         question: String,
         tools: [ToolSpec],
         artifactURL: URL,
-        parameters requestedParameters: EdgeGenerateParameters = .default
+        parameters requestedParameters: EdgeGenerateParameters = .default,
+        visiblePrefillStepOverride: Int? = nil,
+        capturePrefillStepOverride: Int? = nil,
+        captureUsesSyncPrefillOverride: Bool? = nil,
+        includeForcedTokenCrossover: Bool = true,
+        outputTextSink: (([String: String]) -> Void)? = nil
     ) async throws -> NeuralImprintGreedyEquivalenceResult {
         guard state == .ready else {
             throw EdgeRuntimeError.loadFailed("No LLM model loaded")
@@ -545,14 +551,23 @@ public final class LLMEngine: ObservableObject {
             visibleTokenIDs.dropFirst(render.prefixTokenIDs.count)
         )
         let memorySnapshot = DeviceProfile.captureMemorySnapshot()
-        let captureUsesSyncPrefill = Self.neuralImprintCaptureUsesSyncPrefill(
-            memorySnapshot: memorySnapshot,
-            planSyncEval: currentPlan?.syncEval
+        let visiblePrefillStep = max(
+            1,
+            visiblePrefillStepOverride ?? parameters.prefillStepSize
         )
-        let capturePrefillStep = Self.neuralImprintCapturePrefillStep(
-            prefixTokenCount: render.prefixTokenIDs.count,
-            planPrefillStepSize: currentPlan?.prefillStepSize,
-            syncPrefill: captureUsesSyncPrefill
+        let captureUsesSyncPrefill = captureUsesSyncPrefillOverride
+            ?? Self.neuralImprintCaptureUsesSyncPrefill(
+                memorySnapshot: memorySnapshot,
+                planSyncEval: currentPlan?.syncEval
+            )
+        let capturePrefillStep = max(
+            1,
+            capturePrefillStepOverride
+                ?? Self.neuralImprintCapturePrefillStep(
+                    prefixTokenCount: render.prefixTokenIDs.count,
+                    planPrefillStepSize: currentPlan?.prefillStepSize,
+                    syncPrefill: captureUsesSyncPrefill
+                )
         )
         try FileManager.default.createDirectory(
             at: artifactURL.deletingLastPathComponent(),
@@ -578,9 +593,11 @@ public final class LLMEngine: ObservableObject {
             visibleTokenIDs: visibleTokenIDs,
             artifactURL: artifactURL,
             maxTokens: parameters.maxTokens,
-            visiblePrefillStep: parameters.prefillStepSize,
+            visiblePrefillStep: visiblePrefillStep,
             capturePrefillStep: capturePrefillStep,
-            captureUsesSyncPrefill: captureUsesSyncPrefill
+            captureUsesSyncPrefill: captureUsesSyncPrefill,
+            includeForcedTokenCrossover: includeForcedTokenCrossover,
+            outputTextSink: outputTextSink
         )
     }
     #endif

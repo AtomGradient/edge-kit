@@ -32,6 +32,7 @@ public struct NeuralImprintGreedyPathReceipt: Codable, Sendable, Equatable {
 public struct NeuralImprintGreedyDivergenceProbe: Codable, Sendable, Equatable {
     public let tokenIndex: Int
     public let selectedTokenIDsByMode: [String: Int]
+    public let logitMarginsByMode: [String: Double]
     public let sampleDiagnosticsByMode: [String: String]
 }
 
@@ -95,7 +96,7 @@ public struct NeuralImprintGreedyEquivalenceResult: Codable, Sendable, Equatable
 }
 
 enum NeuralImprintGreedyEquivalenceSupport {
-    static let schemaVersion = "edge-kit.neural_imprint_greedy_equivalence.v2"
+    static let schemaVersion = "edge-kit.neural_imprint_greedy_equivalence.v3"
     static let crossoverSchemaVersion =
         "edge-kit.neural_imprint_forced_token_crossover.v1"
 
@@ -103,6 +104,7 @@ enum NeuralImprintGreedyEquivalenceSupport {
         let receipt: NeuralImprintGreedyPathReceipt
         let tokenIDs: [Int]
         let sampleDiagnostics: [String]
+        let decodedText: String
     }
 
     private struct ForcedGeneratedPath {
@@ -122,7 +124,9 @@ enum NeuralImprintGreedyEquivalenceSupport {
         maxTokens: Int,
         visiblePrefillStep: Int,
         capturePrefillStep: Int,
-        captureUsesSyncPrefill: Bool
+        captureUsesSyncPrefill: Bool,
+        includeForcedTokenCrossover: Bool = true,
+        outputTextSink: (([String: String]) -> Void)? = nil
     ) throws -> NeuralImprintGreedyEquivalenceResult {
         let session = try QwenCmlxLazyDecodeSession(
             bundleIndex: bundleIndex,
@@ -187,6 +191,12 @@ enum NeuralImprintGreedyEquivalenceSupport {
             prefillStep: visiblePrefillStep
         )
 
+        outputTextSink?([
+            visible.receipt.mode: visible.decodedText,
+            live.receipt.mode: live.decodedText,
+            restored.receipt.mode: restored.decodedText,
+        ])
+
         let comparison = compare(
             visible: visible.tokenIDs,
             live: live.tokenIDs,
@@ -198,7 +208,11 @@ enum NeuralImprintGreedyEquivalenceSupport {
             comparison.liveRestoredFirstTokenDifference,
             comparison.visibleRestoredFirstTokenDifference,
         ].compactMap { $0 }).sorted()
-        let crossoverResult = try comparison.visibleLiveFirstTokenDifference.flatMap {
+        let crossoverResult = try (
+            includeForcedTokenCrossover
+                ? comparison.visibleLiveFirstTokenDifference
+                : nil
+        ).flatMap {
             try forcedTokenCrossover(
                 interventionIndex: $0,
                 session: session,
@@ -601,6 +615,14 @@ enum NeuralImprintGreedyEquivalenceSupport {
                     ($0.receipt.mode, $0.tokenIDs[index])
                 }
             ),
+            logitMarginsByMode: Dictionary(
+                uniqueKeysWithValues: available.compactMap { path in
+                    diagnosticValue(
+                        named: "margin",
+                        in: path.sampleDiagnostics[index]
+                    ).map { (path.receipt.mode, $0) }
+                }
+            ),
             sampleDiagnosticsByMode: Dictionary(
                 uniqueKeysWithValues: available.map {
                     ($0.receipt.mode, $0.sampleDiagnostics[index])
@@ -648,8 +670,22 @@ enum NeuralImprintGreedyEquivalenceSupport {
                 textSHA256: sha256Text(decodedText)
             ),
             tokenIDs: generatedTokenIDs,
-            sampleDiagnostics: sampleDiagnostics
+            sampleDiagnostics: sampleDiagnostics,
+            decodedText: decodedText
         )
+    }
+
+    static func diagnosticValue(named name: String, in diagnostic: String) -> Double? {
+        let prefix = "\(name)="
+        guard let valueStart = diagnostic.range(of: prefix)?.upperBound else {
+            return nil
+        }
+        let value = diagnostic[valueStart...].prefix { character in
+            character == "-" || character == "+" || character == "."
+                || character.isNumber
+        }
+        guard !value.isEmpty else { return nil }
+        return Double(String(value))
     }
 
     private static func prefillCapturedPrefix(

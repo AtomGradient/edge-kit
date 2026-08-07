@@ -106,4 +106,22 @@ final class NeuralImprintGreedyEquivalenceDiagnosticTests: XCTestCase {
         XCTAssertNil(object["text"])
         XCTAssertEqual(object["interventionTokenID"] as? Int, 100_937)
     }
+
+    func testDiagnosticValueExtractsLogitMarginWithoutCandidates() {
+        let diagnostic = "sample token=42 logit=20.281250 margin=0.015625 mode=greedy candidates=42:0.5:20.2"
+
+        XCTAssertEqual(
+            NeuralImprintGreedyEquivalenceSupport.diagnosticValue(
+                named: "margin",
+                in: diagnostic
+            ),
+            0.015625
+        )
+        XCTAssertNil(
+            NeuralImprintGreedyEquivalenceSupport.diagnosticValue(
+                named: "missing",
+                in: diagnostic
+            )
+        )
+    }
 }
