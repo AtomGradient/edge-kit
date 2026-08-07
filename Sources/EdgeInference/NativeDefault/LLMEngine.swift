@@ -602,6 +602,95 @@ public final class LLMEngine: ObservableObject {
             outputTextSink: outputTextSink
         )
     }
+
+    @MainActor
+    public func runNeuralImprintSampledBoundaryDiagnostic(
+        profileBody: String,
+        question: String,
+        tools: [ToolSpec],
+        parameters requestedParameters: EdgeGenerateParameters,
+        samplingSeed: UInt64,
+        prefillStepOverride: Int = 256,
+        selectedMode: String? = nil,
+        outputTextSink: (([String: String]) -> Void)? = nil
+    ) async throws -> NeuralImprintSampledBoundaryResult {
+        guard state == .ready else {
+            throw EdgeRuntimeError.loadFailed("No LLM model loaded")
+        }
+        guard nativeUseCmlxLazyDecode else {
+            throw EdgeRuntimeError.unsupportedFeature(
+                "Neural Imprint sampled boundary diagnostic requires native CMLX lazy decode"
+            )
+        }
+        guard !profileBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              requestedParameters.maxTokens > 0,
+              requestedParameters.temperature > 0
+        else {
+            throw QwenHybridModelReferenceError.emptyTokenIds
+        }
+        guard let runtime = nativeRuntime,
+              let bundleIndex = nativeBundleIndex,
+              let tokenizer = nativeTokenizer
+        else {
+            throw EdgeRuntimeError.loadFailed("Native Qwen runtime is not initialized")
+        }
+
+        var parameters = Self.neuralImprintCompatibleParameters(requestedParameters)
+        parameters.enableThinking = false
+        parameters.preserveThinking = false
+        let render = try NeuralImprintRuntimeSupport.renderPrefix(
+            profileBody: profileBody,
+            tools: tools,
+            parameters: parameters,
+            tokenizer: tokenizer,
+            additionalContext: Self.chatTemplateContext(parameters:)
+        )
+        let visibleTokenIDs = try tokenizer.applyChatTemplate(
+            messages: [
+                ChatMessage.system(render.systemPrompt),
+                ChatMessage.user(question),
+            ].chatTemplateMessages(preserveThinking: false),
+            tools: tools.isEmpty ? nil : tools,
+            additionalContext: Self.chatTemplateContext(parameters: parameters)
+        )
+        guard visibleTokenIDs.count > render.prefixTokenIDs.count,
+              Array(visibleTokenIDs.prefix(render.prefixTokenIDs.count))
+                == render.prefixTokenIDs
+        else {
+            throw EdgeRuntimeError.loadFailed(
+                "Visible prompt does not share the Neural Imprint prefix token sequence"
+            )
+        }
+        let suffixTokenIDs = Array(
+            visibleTokenIDs.dropFirst(render.prefixTokenIDs.count)
+        )
+        let prefillStep = max(1, prefillStepOverride)
+        try applyCmlxCommandBufferLimits(
+            contextLengthHint: visibleTokenIDs.count + parameters.maxTokens
+        )
+
+        state = .generating
+        defer {
+            if state == .generating {
+                state = .ready
+            }
+        }
+        return try NeuralImprintSampledBoundarySupport.run(
+            bundleIndex: bundleIndex,
+            runtime: runtime,
+            tokenizer: tokenizer,
+            endTokenIDs: nativeEndTokenIds,
+            prefixTokenIDs: render.prefixTokenIDs,
+            suffixTokenIDs: suffixTokenIDs,
+            visibleTokenIDs: visibleTokenIDs,
+            parameters: parameters,
+            samplingSeed: samplingSeed,
+            prefillStep: prefillStep,
+            selectedMode: selectedMode,
+            outputTextSink: outputTextSink
+        )
+    }
     #endif
 
     public func captureHiddenStates(

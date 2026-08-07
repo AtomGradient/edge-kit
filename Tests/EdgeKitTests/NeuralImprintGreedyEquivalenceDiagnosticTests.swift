@@ -136,4 +136,32 @@ final class NeuralImprintGreedyEquivalenceDiagnosticTests: XCTestCase {
         XCTAssertEqual(ranges[ranges.count - 2], 1_792..<2_039)
         XCTAssertFalse(ranges.contains { $0.contains(2_038) && $0.contains(2_039) })
     }
+
+    func testSampledBoundaryComparisonSeparatesAllThreePairs() {
+        let comparison = NeuralImprintSampledBoundarySupport.compare(
+            original: [1, 2, 3, 4],
+            aligned: [1, 2, 8, 4],
+            neuralImprint: [1, 2, 8, 9]
+        )
+
+        XCTAssertFalse(comparison.originalAlignedTokenIDsEqual)
+        XCTAssertFalse(comparison.originalNITokenIDsEqual)
+        XCTAssertFalse(comparison.alignedNITokenIDsEqual)
+        XCTAssertEqual(comparison.originalAlignedFirstTokenDifference, 2)
+        XCTAssertEqual(comparison.originalNIFirstTokenDifference, 2)
+        XCTAssertEqual(comparison.alignedNIFirstTokenDifference, 3)
+    }
+
+    func testSampledBoundaryComparisonTreatsLengthMismatchAsDifference() {
+        let comparison = NeuralImprintSampledBoundarySupport.compare(
+            original: [1, 2],
+            aligned: [1, 2],
+            neuralImprint: [1, 2, 3]
+        )
+
+        XCTAssertTrue(comparison.originalAlignedTokenIDsEqual)
+        XCTAssertNil(comparison.originalAlignedFirstTokenDifference)
+        XCTAssertEqual(comparison.originalNIFirstTokenDifference, 2)
+        XCTAssertEqual(comparison.alignedNIFirstTokenDifference, 2)
+    }
 }
