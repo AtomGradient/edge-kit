@@ -141,6 +141,15 @@ public final class LLMEngine: ObservableObject {
         ]
     }
 
+    nonisolated static func generationEndDiagnostic(
+        backend: String,
+        stoppedOnEndToken: Bool,
+        generatedTokenCount: Int
+    ) -> String {
+        let reason = stoppedOnEndToken ? "natural_eos" : "max_tokens_or_other"
+        return "edgekit_generation_end backend=\(backend) reason=\(reason) generated=\(generatedTokenCount)"
+    }
+
     private func emitDecodedTextIfNeeded(
         tokenizer: Tokenizer,
         generatedTokenIds: [Int],
@@ -1514,6 +1523,7 @@ public final class LLMEngine: ObservableObject {
         var rng = EdgeSeededRandomNumberGenerator(seed: UInt64.random(in: 1...UInt64.max))
         var generatedTokenIds: [Int] = []
         generatedTokenIds.reserveCapacity(parameters.maxTokens)
+        var stoppedOnEndToken = false
         var emittedText = ""
         var emittedTokenCount = 0
         var buffersToolCallText = onToolCall != nil
@@ -1549,6 +1559,7 @@ public final class LLMEngine: ObservableObject {
             if parameters.stopOnEndToken,
                nativeEndTokenIds.contains(tokenId),
                generatedTokenIds.count >= parameters.minimumGeneratedTokens {
+                stoppedOnEndToken = true
                 session.invalidateCurrentLogits()
                 break
             }
@@ -1663,6 +1674,13 @@ public final class LLMEngine: ObservableObject {
             turn: turn
         )
         lastMetrics = metrics
+        diagnosticSink?(
+            Self.generationEndDiagnostic(
+                backend: "native_fallback",
+                stoppedOnEndToken: stoppedOnEndToken,
+                generatedTokenCount: generatedTokenIds.count
+            )
+        )
         recordOnlineCalibration(metrics: metrics)
         generateSucceeded = true
     }
@@ -2282,6 +2300,13 @@ public final class LLMEngine: ObservableObject {
             turn: turnCounter
         )
         lastMetrics = metrics
+        diagnosticSink?(
+            Self.generationEndDiagnostic(
+                backend: "cmlx_lazy",
+                stoppedOnEndToken: stoppedTokenId != nil,
+                generatedTokenCount: generatedTokenIds.count
+            )
+        )
         diagnosticSink?(
             "cmlx_lazy_decode_done generated=\(generatedTokenIds.count) ttftMs=\(Int(firstTokenAt.timeIntervalSince(startedAt) * 1000)) tps=\(String(format: "%.1f", Double(generatedTokenIds.count) / decodeSeconds))"
         )

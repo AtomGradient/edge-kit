@@ -84,6 +84,25 @@ final class LLMEngineTests: XCTestCase {
         XCTAssertEqual(status.modelID, "Qwen3.5-9B-4bit")
     }
 
+    func testGenerationEndDiagnosticDistinguishesEOSFromTokenCapAcrossBackends() {
+        XCTAssertEqual(
+            LLMEngine.generationEndDiagnostic(
+                backend: "native_fallback",
+                stoppedOnEndToken: true,
+                generatedTokenCount: 106
+            ),
+            "edgekit_generation_end backend=native_fallback reason=natural_eos generated=106"
+        )
+        XCTAssertEqual(
+            LLMEngine.generationEndDiagnostic(
+                backend: "cmlx_lazy",
+                stoppedOnEndToken: false,
+                generatedTokenCount: 512
+            ),
+            "edgekit_generation_end backend=cmlx_lazy reason=max_tokens_or_other generated=512"
+        )
+    }
+
     func testDSREvictionIntervalEnvironmentOverrideParsesPositiveInteger() {
         XCTAssertEqual(
             LLMEngine.dsrEvictionIntervalEnvironmentOverride(
